@@ -2964,7 +2964,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
 
     function thumbnailSrc(item) {{
-      return '/api/thumbnail?index=' + encodeURIComponent(item.index || 0);
+      const version = [item.filename || '', item.source_path || '', item.status || ''].join('|');
+      return '/api/thumbnail?index=' + encodeURIComponent(item.index || 0)
+        + '&v=' + encodeURIComponent(version);
     }}
 
     function localizedStatus(item) {{
@@ -3727,7 +3729,7 @@ def run_web_gui(port: int = 8765) -> None:
         def send_binary(self, body: bytes, content_type: str, status: int = 200) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "private, max-age=300")
+            self.send_header("Cache-Control", "private, max-age=300, must-revalidate")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
