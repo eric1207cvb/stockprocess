@@ -124,7 +124,7 @@ CAPACITY_STOP_STREAK = 3
 CAPACITY_RETRY_DELAYS = [20, 45, 90]
 DEFAULT_MAX_FILE_MB = 64
 MAX_FILE_MB = 512
-MODEL_MAX_OUTPUT_TOKENS = 3000
+MODEL_MAX_OUTPUT_TOKENS = 5000
 DEFAULT_REUSE_SIMILAR_IMAGES = True
 DEFAULT_SIMILARITY_THRESHOLD = 7
 
@@ -142,6 +142,8 @@ DEFAULT_PROMPT = """請為國際圖庫上架產生英文 metadata。
 KEYWORD_OPTIMIZATION_GUIDE = """Keyword 欄位規則：
 - 使用者需求中的圖庫規則、語言、數量、分隔方式與禁止詞優先於一般規則。
 - keywords 必須使用使用者指定語言；例如要求日文圖庫時使用日文/片假名常用搜尋詞，要求英文圖庫時使用英文，不要自行混用語言。
+- 若使用者在同一個 prompt 指定多個圖庫、語言或 keyword 數量，必須在 keyword_groups 逐組輸出，每組 name 使用圖庫/規則名稱，每組 keywords 的語言與數量都要符合該組規則。
+- top-level keywords 必須等於第一組或主要圖庫的 keywords，供舊版流程相容；所有額外圖庫關鍵字放在 keyword_groups。
 - 若使用者指定圖庫平台，請依該平台常見 metadata 習慣排列；若未指定平台，使用通用圖庫排序。
 - 排序要以搜尋成交可能性為優先：主體/物件、動作、場景、構圖、可確認地點或文化元素、情緒/概念、用途、同義詞與長尾搜尋詞。
 - 前 10 個 keywords 放最核心、最容易被搜尋且最能代表照片的詞；後面再補場景、風格、用途、抽象概念與同義詞。
@@ -157,11 +159,35 @@ METADATA_JSON_SCHEMA: dict[str, Any] = {
         "description": {"type": "string"},
         "zh_summary": {"type": "string"},
         "keywords": {"type": "array", "items": {"type": "string"}},
+        "keyword_groups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "language": {"type": "string"},
+                    "keywords": {"type": "array", "items": {"type": "string"}},
+                    "copy_line": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["name", "language", "keywords", "copy_line", "notes"],
+                "additionalProperties": False,
+            },
+        },
         "categories": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "string"},
         "copy_line": {"type": "string"},
     },
-    "required": ["title", "description", "zh_summary", "keywords", "categories", "notes", "copy_line"],
+    "required": [
+        "title",
+        "description",
+        "zh_summary",
+        "keywords",
+        "keyword_groups",
+        "categories",
+        "notes",
+        "copy_line",
+    ],
     "additionalProperties": False,
 }
 
@@ -199,6 +225,7 @@ class ImageResult:
     description: str = ""
     zh_summary: str = ""
     keywords: Optional[list[str]] = None
+    keyword_groups: Optional[list[dict[str, Any]]] = None
     categories: Optional[list[str]] = None
     notes: str = ""
     copy_line: str = ""
@@ -215,6 +242,7 @@ class ImageResult:
             "description": self.description,
             "zh_summary": self.zh_summary,
             "keywords": ", ".join(self.keywords or []),
+            "keyword_groups": json.dumps(self.keyword_groups or [], ensure_ascii=False),
             "categories": ", ".join(self.categories or []),
             "notes": self.notes,
             "copy_line": self.copy_line,
@@ -561,6 +589,7 @@ def clone_metadata_from_similar(result: ImageResult, source: ImageResult, distan
         else f"與 {source.filename} 相似，已沿用 metadata。"
     )
     result.keywords = list(source.keywords or [])
+    result.keyword_groups = [dict(group) for group in (source.keyword_groups or [])]
     result.categories = list(source.categories or [])
     result.copy_line = source.copy_line
     result.notes = (
@@ -597,7 +626,8 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
 - 第一個字元必須是 {，最後一個字元必須是 }。
 - 不要 markdown，不要註解，不要在 JSON 前後加入任何文字。
 - 字串內需要換行時請使用 \\n，不要直接換行。
-- 必須保留 title、description、zh_summary、keywords、categories、notes、copy_line 這些 key。
+- 必須保留 title、description、zh_summary、keywords、keyword_groups、categories、notes、copy_line 這些 key。
+- keyword_groups 若只有一組 keywords，也請放一組。
 - 沒有資料時請用空字串或空陣列，不要省略 key。
 """
     return f"""你是專業圖庫照片 metadata 標注員。請根據圖片內容與使用者需求產生可上架的資料。
@@ -616,6 +646,15 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
   "description": "string",
   "zh_summary": "繁體中文一句話，說明照片主體與場景，只供使用者辨識照片，不放入圖庫 metadata",
   "keywords": ["依使用者指定語言與圖庫排序的 keyword 1", "keyword 2"],
+  "keyword_groups": [
+    {
+      "name": "圖庫或規則名稱，例如 Adobe Stock / 日本圖庫",
+      "language": "該組 keywords 的語言，例如 English / Japanese",
+      "keywords": ["該組 keyword 1", "keyword 2"],
+      "copy_line": "該組可直接貼上圖庫的內容",
+      "notes": "該組規則的提醒；沒有則空字串"
+    }
+  ],
   "categories": ["category 1", "category 2"],
   "notes": "string",
   "copy_line": "title<TAB>description<TAB>keyword1, keyword2, keyword3"
@@ -842,6 +881,64 @@ def split_list(value: Any) -> list[str]:
     return cleaned
 
 
+def normalize_keyword_group(
+    value: Any,
+    index: int,
+    title: str,
+    description: str,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    keywords = split_list(value.get("keywords"))
+    if not keywords:
+        return None
+    name = str(
+        value.get("name")
+        or value.get("gallery")
+        or value.get("platform")
+        or value.get("label")
+        or f"Keywords {index}"
+    ).strip()
+    language = str(value.get("language", "")).strip()
+    notes = str(value.get("notes", "")).strip()
+    copy_line = str(value.get("copy_line", "")).strip()
+    if not copy_line:
+        copy_line = f"{title}\t{description}\t{', '.join(keywords)}"
+    return {
+        "name": name or f"Keywords {index}",
+        "language": language,
+        "keywords": keywords,
+        "copy_line": copy_line,
+        "notes": notes,
+    }
+
+
+def normalize_keyword_groups(
+    value: Any,
+    title: str,
+    description: str,
+    fallback_keywords: list[str],
+    fallback_copy_line: str,
+) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    items = value if isinstance(value, list) else []
+    for index, item in enumerate(items, start=1):
+        group = normalize_keyword_group(item, index, title, description)
+        if group is not None:
+            groups.append(group)
+    if not groups and fallback_keywords:
+        groups.append(
+            {
+                "name": "Keywords",
+                "language": "",
+                "keywords": list(fallback_keywords),
+                "copy_line": fallback_copy_line or f"{title}\t{description}\t{', '.join(fallback_keywords)}",
+                "notes": "",
+            }
+        )
+    return groups
+
+
 def normalize_metadata(data: dict[str, Any]) -> dict[str, Any]:
     title = str(data.get("title", "")).strip()
     description = str(data.get("description", "")).strip()
@@ -850,6 +947,17 @@ def normalize_metadata(data: dict[str, Any]) -> dict[str, Any]:
     categories = split_list(data.get("categories"))
     notes = str(data.get("notes", "")).strip()
     copy_line = str(data.get("copy_line", "")).strip()
+    keyword_groups = normalize_keyword_groups(
+        data.get("keyword_groups"),
+        title,
+        description,
+        keywords,
+        copy_line,
+    )
+    if not keywords and keyword_groups:
+        keywords = list(keyword_groups[0].get("keywords", []))
+    if not copy_line and keyword_groups:
+        copy_line = str(keyword_groups[0].get("copy_line", "")).strip()
     if not copy_line:
         copy_line = f"{title}\t{description}\t{', '.join(keywords)}"
     if not zh_summary:
@@ -859,6 +967,7 @@ def normalize_metadata(data: dict[str, Any]) -> dict[str, Any]:
         "description": description,
         "zh_summary": zh_summary,
         "keywords": keywords,
+        "keyword_groups": keyword_groups,
         "categories": categories,
         "notes": notes,
         "copy_line": copy_line,
@@ -968,6 +1077,7 @@ def analyze_images(
             provider=config.provider,
             model=config.model,
             keywords=[],
+            keyword_groups=[],
             categories=[],
             prompt_signature=metadata_signature,
         )
@@ -1077,6 +1187,7 @@ def analyze_images(
             result.description = normalized["description"]
             result.zh_summary = normalized["zh_summary"]
             result.keywords = normalized["keywords"]
+            result.keyword_groups = normalized["keyword_groups"]
             result.categories = normalized["categories"]
             result.notes = normalized["notes"]
             result.copy_line = normalized["copy_line"]
@@ -1349,6 +1460,7 @@ def write_outputs(output_dir: Path, results: list[ImageResult], config: RunConfi
         "description",
         "zh_summary",
         "keywords",
+        "keyword_groups",
         "categories",
         "notes",
         "copy_line",
@@ -1413,6 +1525,16 @@ def build_result_manifest(
 def result_from_dict(data: dict[str, Any], fallback_index: int) -> ImageResult:
     keywords = data.get("keywords")
     categories = data.get("categories")
+    title = str(data.get("title", ""))
+    description = str(data.get("description", ""))
+    normalized_keywords = keywords if isinstance(keywords, list) else split_list(keywords)
+    keyword_groups = normalize_keyword_groups(
+        data.get("keyword_groups"),
+        title,
+        description,
+        normalized_keywords,
+        str(data.get("copy_line", "")),
+    )
     return ImageResult(
         index=int(data.get("index") or fallback_index),
         filename=str(data.get("filename", "")),
@@ -1420,10 +1542,11 @@ def result_from_dict(data: dict[str, Any], fallback_index: int) -> ImageResult:
         status=str(data.get("status", "ok")),
         provider=str(data.get("provider", "")),
         model=str(data.get("model", "")),
-        title=str(data.get("title", "")),
-        description=str(data.get("description", "")),
+        title=title,
+        description=description,
         zh_summary=str(data.get("zh_summary", "")),
-        keywords=keywords if isinstance(keywords, list) else split_list(keywords),
+        keywords=normalized_keywords,
+        keyword_groups=keyword_groups,
         categories=categories if isinstance(categories, list) else split_list(categories),
         notes=str(data.get("notes", "")),
         copy_line=str(data.get("copy_line", "")),
@@ -1574,6 +1697,36 @@ def build_html_report(results: list[ImageResult], payload: dict[str, Any]) -> st
         keywords = ", ".join(result.keywords or [])
         categories = ", ".join(result.categories or [])
         copy_line = result.copy_line or f"{result.title}\t{result.description}\t{keywords}"
+        groups = result.keyword_groups or [
+            {
+                "name": "Keywords",
+                "keywords": result.keywords or [],
+                "copy_line": copy_line,
+                "language": "",
+                "notes": "",
+            }
+        ]
+        group_blocks: list[str] = []
+        group_buttons: list[str] = []
+        for group in groups:
+            group_name = str(group.get("name") or "Keywords")
+            group_keywords = split_list(group.get("keywords"))
+            group_keyword_text = ", ".join(group_keywords)
+            group_copy_line = str(group.get("copy_line") or f"{result.title}\t{result.description}\t{group_keyword_text}")
+            group_blocks.append(
+                '<div class="keyword-group">'
+                f'<div class="muted">{html.escape(group_name)} · {len(group_keywords)} keywords</div>'
+                f'<div>{html.escape(group_keyword_text)}</div>'
+                '</div>'
+            )
+            group_buttons.append(
+                f'<button data-copy="{html.escape(group_keyword_text, quote=True)}">'
+                f'{html.escape(group_name)} 關鍵字({len(group_keywords)})</button>'
+            )
+            group_buttons.append(
+                f'<button data-copy="{html.escape(group_copy_line, quote=True)}">'
+                f'{html.escape(group_name)} 整列</button>'
+            )
         status_label = "完成" if result.status == "ok" else "錯誤"
         status_class = "ok" if result.status == "ok" else "error"
         rows.append(
@@ -1592,11 +1745,14 @@ def build_html_report(results: list[ImageResult], payload: dict[str, Any]) -> st
                 <div class="notes">{html.escape(result.notes or result.error)}</div>
               </td>
               <td>
-                <div class="keywords">{html.escape(keywords)}</div>
+                <div class="keywords">{"".join(group_blocks)}</div>
                 <div class="muted">{html.escape(categories)}</div>
               </td>
               <td class="actions">
-                <button data-copy="{html.escape(keywords, quote=True)}">複製關鍵字</button>
+                <button data-copy="{html.escape(result.title, quote=True)}">複製標題</button>
+                <button data-copy="{html.escape(result.description, quote=True)}">複製描述</button>
+                <button data-copy="{html.escape(result.title + chr(9) + result.description, quote=True)}">複製標題+描述</button>
+                {"".join(group_buttons)}
                 <button data-copy="{html.escape(copy_line, quote=True)}">複製整列</button>
               </td>
             </tr>
@@ -1709,6 +1865,7 @@ def build_html_report(results: list[ImageResult], payload: dict[str, Any]) -> st
     .filename, .title {{ font-weight: 650; }}
     .description, .keywords, .notes {{ margin-top: 6px; }}
     .keywords {{ max-width: 520px; }}
+    .keyword-group {{ margin-bottom: 10px; }}
     .notes {{ color: var(--error); }}
     .muted {{
       color: var(--muted);
@@ -1736,6 +1893,9 @@ def build_html_report(results: list[ImageResult], payload: dict[str, Any]) -> st
       border: 0;
       border-radius: 6px;
       padding: 8px 10px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      white-space: normal;
       color: #fff;
       background: var(--button);
       cursor: pointer;
@@ -2341,11 +2501,22 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .title {{ font-weight: 650; margin-bottom: 6px; }}
     .description, .keywords, .notes {{ line-height: 1.45; }}
     .keywords {{ min-width: 260px; max-width: 360px; }}
+    .keyword-group {{
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #eef2f7;
+    }}
+    .keyword-group:last-child {{ border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }}
+    .keyword-group-name {{ font-weight: 700; color: #344054; margin-bottom: 4px; }}
     .notes {{ max-width: 260px; }}
     .actions button {{
-      width: 72px;
+      min-width: 86px;
+      max-width: 150px;
       margin-bottom: 7px;
       padding: 7px 9px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      white-space: normal;
     }}
     .tablewrap, .logwrap {{
       min-height: 0;
@@ -2707,6 +2878,73 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       return item.title ? '照片內容請參考英文標題：' + item.title : '尚未產生中文說明。';
     }}
 
+    function itemKeywordGroups(item) {{
+      const rawGroups = Array.isArray(item.keyword_groups) ? item.keyword_groups : [];
+      const groups = rawGroups.map((group, index) => {{
+        const keywords = Array.isArray(group.keywords) ? group.keywords : [];
+        return {{
+          name: String(group.name || ('Keywords ' + (index + 1))),
+          language: String(group.language || ''),
+          keywords,
+          notes: String(group.notes || ''),
+          copy_line: String(group.copy_line || '')
+        }};
+      }}).filter(group => group.keywords.length > 0);
+      if (!groups.length && Array.isArray(item.keywords) && item.keywords.length) {{
+        groups.push({{
+          name: 'Keywords',
+          language: '',
+          keywords: item.keywords,
+          notes: '',
+          copy_line: item.copy_line || ''
+        }});
+      }}
+      return groups;
+    }}
+
+    function groupKeywordText(group) {{
+      return (group.keywords || []).join(', ');
+    }}
+
+    function groupCopyLine(item, group) {{
+      return group.copy_line || [item.title || '', item.description || '', groupKeywordText(group)].join('\\t');
+    }}
+
+    function renderKeywordGroups(item) {{
+      const groups = itemKeywordGroups(item);
+      if (!groups.length) return '';
+      return groups.map(group => {{
+        const language = group.language ? ' · ' + group.language : '';
+        const notes = group.notes ? '<div class="hint">' + esc(group.notes) + '</div>' : '';
+        return `
+          <div class="keyword-group">
+            <div class="keyword-group-name">${{esc(group.name)}} · ${{group.keywords.length}} 個 keywords${{esc(language)}}</div>
+            <div>${{esc(groupKeywordText(group))}}</div>
+            ${{notes}}
+          </div>
+        `;
+      }}).join('');
+    }}
+
+    function renderCopyButtons(item) {{
+      const groups = itemKeywordGroups(item);
+      const title = item.title || '';
+      const description = item.description || '';
+      const buttons = [
+        `<button type="button" data-copy="${{esc(title)}}">標題</button>`,
+        `<button type="button" data-copy="${{esc(description)}}">描述</button>`,
+        `<button type="button" data-copy="${{esc([title, description].join('\\t'))}}">標題+描述</button>`
+      ];
+      groups.forEach(group => {{
+        const label = group.name || 'Keywords';
+        buttons.push(`<button type="button" data-copy="${{esc(groupKeywordText(group))}}">${{esc(label)}}關鍵字(${{group.keywords.length}})</button>`);
+        buttons.push(`<button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>`);
+      }});
+      buttons.push(`<button type="button" data-copy="${{esc(item.copy_line || [title, description, (item.keywords || []).join(', ')].join('\\t'))}}">主整列</button>`);
+      buttons.push(`<button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>`);
+      return buttons.join('');
+    }}
+
     function formatDuration(seconds) {{
       const total = Math.max(0, Math.floor(Number(seconds) || 0));
       const minutes = Math.floor(total / 60);
@@ -2776,9 +3014,6 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       log.textContent = (status.logs || []).join('\\n');
       log.parentElement.scrollTop = log.parentElement.scrollHeight;
       results.innerHTML = (status.results || []).map(item => {{
-        const keywordItems = item.keywords || [];
-        const keywords = keywordItems.join(', ');
-        const copyLine = item.copy_line || [item.title || '', item.description || '', keywords].join('\\t');
         return `
           <tr>
             <td class="photo-cell">
@@ -2792,12 +3027,10 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
               <div class="title">${{esc(item.title)}}</div>
               <div class="description">${{esc(item.description)}}</div>
             </td>
-            <td class="keywords"><div class="hint">${{keywordItems.length}} 個 keywords</div>${{esc(keywords)}}</td>
+            <td class="keywords">${{renderKeywordGroups(item)}}</td>
             <td class="notes">${{esc(item.notes || item.error || '')}}</td>
             <td class="actions">
-              <button type="button" data-copy="${{esc(keywords)}}">關鍵字</button>
-              <button type="button" data-copy="${{esc(copyLine)}}">整列</button>
-              <button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>
+              ${{renderCopyButtons(item)}}
             </td>
           </tr>
         `;
@@ -3776,20 +4009,29 @@ def run_gui() -> None:
             )
             copy_bar = ttk.Frame(detail)
             copy_bar.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-            ttk.Button(copy_bar, text="複製關鍵字", command=self._copy_selected_keywords).grid(
+            ttk.Button(copy_bar, text="複製標題", command=self._copy_selected_title).grid(
                 row=0, column=0, sticky="w", padx=(0, 8)
             )
-            ttk.Button(copy_bar, text="複製整列", command=self._copy_selected_line).grid(
+            ttk.Button(copy_bar, text="複製描述", command=self._copy_selected_description).grid(
                 row=0, column=1, sticky="w", padx=(0, 8)
             )
-            ttk.Button(copy_bar, text="刪除該筆", command=self._delete_selected_result).grid(
+            ttk.Button(copy_bar, text="複製標題+描述", command=self._copy_selected_title_description).grid(
                 row=0, column=2, sticky="w", padx=(0, 8)
             )
-            ttk.Button(copy_bar, text="儲存進度", command=self._save_progress).grid(
+            ttk.Button(copy_bar, text="複製關鍵字", command=self._copy_selected_keywords).grid(
                 row=0, column=3, sticky="w", padx=(0, 8)
             )
+            ttk.Button(copy_bar, text="複製整列", command=self._copy_selected_line).grid(
+                row=0, column=4, sticky="w", padx=(0, 8)
+            )
+            ttk.Button(copy_bar, text="刪除該筆", command=self._delete_selected_result).grid(
+                row=0, column=5, sticky="w", padx=(0, 8)
+            )
+            ttk.Button(copy_bar, text="儲存進度", command=self._save_progress).grid(
+                row=0, column=6, sticky="w", padx=(0, 8)
+            )
             ttk.Button(copy_bar, text="載入進度", command=self._load_progress).grid(
-                row=0, column=4, sticky="w"
+                row=0, column=7, sticky="w"
             )
 
             log_box = ttk.LabelFrame(right, text="Log", padding=8)
@@ -4102,7 +4344,12 @@ def run_gui() -> None:
             self.after(120, self._drain_messages)
 
         def _append_result(self, result: ImageResult) -> None:
-            keywords = ", ".join(result.keywords or [])
+            groups = result.keyword_groups or [{"name": "Keywords", "keywords": result.keywords or []}]
+            keywords = " | ".join(
+                f"{group.get('name') or 'Keywords'} ({len(split_list(group.get('keywords')))}): "
+                f"{', '.join(split_list(group.get('keywords')))}"
+                for group in groups
+            )
             notes = result.notes or result.error
             iid = self.tree.insert(
                 "",
@@ -4131,13 +4378,23 @@ def run_gui() -> None:
             self.selected_status_var.set(
                 f"{'完成' if result.status == 'ok' else '錯誤'} · {result.filename}"
             )
-            keywords = ", ".join(result.keywords or [])
+            groups = result.keyword_groups or [{"name": "Keywords", "keywords": result.keywords or [], "copy_line": result.copy_line}]
+            group_lines: list[str] = []
+            for group in groups:
+                group_keywords = split_list(group.get("keywords"))
+                group_lines.extend(
+                    [
+                        f"{group.get('name') or 'Keywords'} ({len(group_keywords)} keywords):",
+                        ", ".join(group_keywords),
+                        f"Copy line: {group.get('copy_line') or result.copy_line}",
+                        "",
+                    ]
+                )
             detail = "\n".join(
                 [
                     f"Description: {result.description}",
                     "",
-                    f"Keywords: {keywords}",
-                    "",
+                    *group_lines,
                     f"Copy line: {result.copy_line}",
                 ]
             ).strip()
@@ -4153,6 +4410,21 @@ def run_gui() -> None:
             if not self.selected_result:
                 return
             self._copy_to_clipboard(", ".join(self.selected_result.keywords or []))
+
+        def _copy_selected_title(self) -> None:
+            if not self.selected_result:
+                return
+            self._copy_to_clipboard(self.selected_result.title)
+
+        def _copy_selected_description(self) -> None:
+            if not self.selected_result:
+                return
+            self._copy_to_clipboard(self.selected_result.description)
+
+        def _copy_selected_title_description(self) -> None:
+            if not self.selected_result:
+                return
+            self._copy_to_clipboard(f"{self.selected_result.title}\t{self.selected_result.description}")
 
         def _copy_selected_line(self) -> None:
             if not self.selected_result:
