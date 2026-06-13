@@ -89,10 +89,21 @@ DEFAULT_PROMPT = """請為國際圖庫上架產生英文 metadata。
 需求：
 - Title 使用自然英文，最多 80 個字元，不要堆疊關鍵字。
 - Description 使用 1 句自然英文，描述照片主要內容、構圖、用途。
-- Keywords 輸出 35 到 49 個英文關鍵字，最重要的 10 個放最前面。
+- Keywords 輸出 35 到 49 個英文關鍵字，最重要、最可能被買家搜尋的 10 個放最前面。
 - 避免臆測不可確認的品牌、地點、名人、族群、職業或事件。
 - 若畫面有人臉、可識別人物、商標、車牌、受保護藝術品，請在 notes 標示可能需要 release 或有退件風險。
 - 不要輸出 hashtag，不要重複關鍵字，不要加入不存在的物件。
+"""
+
+KEYWORD_OPTIMIZATION_GUIDE = """Keyword 欄位規則：
+- 使用者需求中的圖庫規則、語言、數量、分隔方式與禁止詞優先於一般規則。
+- keywords 必須使用使用者指定語言；例如要求日文圖庫時使用日文/片假名常用搜尋詞，要求英文圖庫時使用英文，不要自行混用語言。
+- 若使用者指定圖庫平台，請依該平台常見 metadata 習慣排列；若未指定平台，使用通用圖庫排序。
+- 排序要以搜尋成交可能性為優先：主體/物件、動作、場景、構圖、可確認地點或文化元素、情緒/概念、用途、同義詞與長尾搜尋詞。
+- 前 10 個 keywords 放最核心、最容易被搜尋且最能代表照片的詞；後面再補場景、風格、用途、抽象概念與同義詞。
+- 不要堆入低價值泛詞，不要重複、不要 hashtag、不要加入看不見或不能確認的品牌/人物/事件。
+- 若使用者要求特定 keyword 數量範圍，必須落在該範圍內；若沒有指定，輸出 35 到 49 個。
+- copy_line 必須配合使用者指定的圖庫貼上格式；若沒有指定，使用 title<TAB>description<TAB>keywords。
 """
 
 METADATA_JSON_SCHEMA: dict[str, Any] = {
@@ -442,6 +453,8 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
 
 使用者需求：
 {prompt}
+
+{KEYWORD_OPTIMIZATION_GUIDE}
 {retry_note}
 
 檔名：{filename}
@@ -451,7 +464,7 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
   "title": "string",
   "description": "string",
   "zh_summary": "繁體中文一句話，說明照片主體與場景，只供使用者辨識照片，不放入圖庫 metadata",
-  "keywords": ["keyword 1", "keyword 2"],
+  "keywords": ["依使用者指定語言與圖庫排序的 keyword 1", "keyword 2"],
   "categories": ["category 1", "category 2"],
   "notes": "string",
   "copy_line": "title<TAB>description<TAB>keyword1, keyword2, keyword3"
@@ -662,7 +675,7 @@ def split_list(value: Any) -> list[str]:
     if isinstance(value, list):
         items = value
     else:
-        items = re.split(r"[,;\n]+", str(value))
+        items = re.split(r"[,;，、\n]+", str(value))
 
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -2139,7 +2152,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           <button type="button" id="deletePromptBtn">刪除 Prompt</button>
         </div>
         <textarea name="prompt">{prompt}</textarea>
-        <div class="hint">Prompt 會存到本機資料夾 ~/.stock_keyworder_prompts/。</div>
+        <div class="hint">可在 Prompt 指定圖庫、語言、keyword 數量、分隔與排序規則；例如英文圖庫或日文圖庫。Prompt 會存到本機資料夾 ~/.stock_keyworder_prompts/。</div>
       </section>
 
       <section>

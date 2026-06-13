@@ -267,15 +267,29 @@ pyinstaller --onefile --windowed --name StockKeyworder stock_keyworder.py
 
 ## Prompt 建議
 
-預設 prompt 偏向國際圖庫英文 metadata。若要針對不同圖庫，直接在 Prompt 欄位寫入該圖庫規則，例如：
+預設 prompt 偏向國際圖庫英文 metadata。`keywords` 會依照 Prompt 中指定的圖庫、語言、數量與排序規則輸出；如果寫日文圖庫規則，keywords 會用日文常用搜尋詞並依搜尋權重排序。如果寫英文圖庫規則，keywords 會用英文並把最重要的詞放前面。
+
+英文圖庫範例：
 
 ```text
 請依照我指定的圖庫規則輸出英文 title、description、keywords。
 Title 最多 80 個字元。
 Description 使用 1 句自然英文。
-Keywords 輸出 35 到 49 個英文關鍵字，最重要的關鍵字放前面。
+Keywords 輸出 35 到 49 個英文關鍵字，最重要、最可能被買家搜尋的 10 個放前面。
 不要包含品牌、商標、推測地點、推測姓名或不存在的物件。
 若有可識別人物、商標、車牌或受保護藝術品，notes 請標示可能風險。
+```
+
+日文圖庫範例：
+
+```text
+請依照日文圖庫上架規則輸出 metadata。
+Title 使用自然日文，最多 60 字。
+Description 使用 1 句自然日文。
+Keywords 輸出 30 到 45 個日文關鍵字，使用日本買家常搜尋的詞。
+前 10 個關鍵字依序放：主要被攝體、場景、用途、情緒或概念。
+可使用常見片假名搜尋詞，但不要混入英文，除非是日本圖庫常用外來語。
+不要加入不可確認的品牌、人物姓名、活動名稱或不存在的物件。
 ```
 
 ## 實作參考
