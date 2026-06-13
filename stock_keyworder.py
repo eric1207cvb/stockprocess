@@ -2966,14 +2966,20 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const done = Number(status.done || 0);
       const percent = total > 0 ? Math.round((done / total) * 100) : 0;
       const phase = current.phase || status.state || '待命';
+      const isWatchMode = status.mode === 'watch';
+      const isWatchIdle = isWatchMode && status.running && !current.filename && /監看中/.test(phase);
       const retryRemaining = current.retry_until ? Math.max(0, Math.ceil(Number(current.retry_until) - now)) : 0;
       const startedAt = Number(current.started_at || current.updated_at || now);
       const elapsed = Math.max(0, now - startedAt);
 
       currentPhase.textContent = phase;
-      currentElapsed.textContent = status.running ? '已等待 ' + formatDuration(elapsed) : '';
+      currentElapsed.textContent = status.running
+        ? (isWatchIdle ? '已監看 ' + formatDuration(elapsed) : '已等待 ' + formatDuration(elapsed))
+        : '';
       if (current.filename) {{
         currentFile.textContent = '第 ' + (current.index || '-') + ' / ' + (current.total || total || '-') + ' 張：' + current.filename;
+      }} else if (isWatchIdle) {{
+        currentFile.textContent = '目前沒有照片正在送 API。';
       }} else {{
         currentFile.textContent = status.running ? '正在準備工作。' : '尚未開始。';
       }}
@@ -2981,7 +2987,11 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const attempts = current.max_attempts
         ? 'API 嘗試 ' + (current.attempt || 1) + ' / ' + current.max_attempts
         : '';
-      currentSub.textContent = attempts || (status.running ? '程式仍在執行，請等候目前 API 回應。' : '開始後會顯示目前處理到哪張照片與 API 狀態。');
+      currentSub.textContent = attempts || (
+        isWatchIdle
+          ? '目前批次已處理完成，正在等待新照片。若不需要繼續監看，按「停止」。'
+          : (status.running ? '程式仍在執行，請等候目前 API 回應。' : '開始後會顯示目前處理到哪張照片與 API 狀態。')
+      );
 
       retryLine.textContent = retryRemaining > 0
         ? '模型忙碌或暫時限流，' + retryRemaining + ' 秒後自動重試。'
@@ -3009,7 +3019,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         serverOffsetSeconds = Number(status.server_time) - Date.now() / 1000;
       }}
       stateText.textContent = status.state || '待命';
-      countText.textContent = ' ' + (status.done || 0) + ' / ' + (status.total || 0);
+      countText.textContent = status.mode === 'watch'
+        ? ' 已處理 ' + (status.done || 0) + ' / 上限 ' + (status.total || 0)
+        : ' ' + (status.done || 0) + ' / ' + (status.total || 0);
       progress.max = Math.max(status.total || 1, 1);
       progress.value = status.done || 0;
       renderActivity(status);
@@ -3082,6 +3094,7 @@ def run_web_gui(port: int = 8765) -> None:
         "thumbnail_cache": {},
         "current": current_progress_payload("待命"),
         "manifest": {},
+        "mode": "",
         "running": False,
         "stop_event": None,
         "worker": None,
@@ -3111,6 +3124,7 @@ def run_web_gui(port: int = 8765) -> None:
                 "logs": list(app_state["logs"]),
                 "results": [asdict(result) for result in results_copy],
                 "running": app_state["running"],
+                "mode": app_state.get("mode", ""),
                 "current": dict(app_state["current"]),
                 "server_time": time.time(),
                 "manifest": dict(app_state["manifest"]),
@@ -3192,9 +3206,12 @@ def run_web_gui(port: int = 8765) -> None:
     def run_job(config: RunConfig, watch_mode: bool, stop_event: threading.Event) -> None:
         def progress(kind: str, payload: Any) -> None:
             if kind == "scan":
-                set_state(total=int(payload["total"]), done=0, state="執行中")
-                set_current(current_progress_payload("掃描完成，準備開始", total=int(payload["total"])))
-                add_log(f"找到/上限 {payload['total']} 張")
+                mode = str(payload.get("mode", "batch"))
+                total = int(payload["total"])
+                phase = "監看中" if mode == "watch" else "掃描完成，準備開始"
+                set_state(total=total, done=0, state=("監看中" if mode == "watch" else "執行中"), mode=mode)
+                set_current(current_progress_payload(phase, total=total))
+                add_log(f"監看上限 {total} 張；放入新照片後會自動分析。" if mode == "watch" else f"找到 {total} 張")
             elif kind == "log":
                 add_log(redact_sensitive(payload, [config.api_key]))
             elif kind == "current":
@@ -3208,17 +3225,29 @@ def run_web_gui(port: int = 8765) -> None:
                         source_token = completed_source_token_for_result(payload)
                         if source_token:
                             app_state["completed_sources"].add(source_token)
-            elif kind in {"done", "saved"}:
-                set_state(manifest=payload, state="完成")
+            elif kind == "saved":
+                if watch_mode:
+                    total_limit = config.max_images
+                    count = int(payload.get("count", 0) or 0)
+                    set_state(manifest=payload, state="監看中", done=count, total=total_limit, mode="watch")
+                    set_current(current_progress_payload("監看中", total=total_limit))
+                    add_log(f"目前批次完成，已處理 {count} 張；繼續監看新照片。")
+                else:
+                    set_state(manifest=payload, state="完成")
+                    set_current(current_progress_payload("完成", total=int(payload.get("count", 0) or 0)))
+                    add_log("完成，結果已顯示在右側表格。")
+            elif kind == "done":
+                final_state = "已停止" if watch_mode and stop_event.is_set() else "完成"
+                set_state(manifest=payload, state=final_state)
                 total_count = int(payload.get("count", 0) or 0)
                 if not total_count:
                     with state_lock:
                         total_count = int(app_state["total"])
-                set_current(current_progress_payload("完成", total=total_count))
+                set_current(current_progress_payload(final_state, total=total_count))
                 if payload.get("html"):
                     add_log(f"報表：{payload.get('html', '')}")
                 else:
-                    add_log("完成，結果已顯示在右側表格。")
+                    add_log("監看已停止。" if final_state == "已停止" else "完成，結果已顯示在右側表格。")
 
         try:
             if watch_mode:
@@ -3418,6 +3447,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "thumbnail_cache": {},
                                 "current": current_progress_payload("準備中"),
                                 "manifest": {},
+                                "mode": "watch" if watch_mode else "batch",
                                 "running": True,
                                 "stop_event": stop_event,
                             }
