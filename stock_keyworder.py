@@ -127,6 +127,7 @@ MAX_FILE_MB = 512
 MODEL_MAX_OUTPUT_TOKENS = 5000
 DEFAULT_REUSE_SIMILAR_IMAGES = True
 DEFAULT_SIMILARITY_THRESHOLD = 7
+METADATA_SCHEMA_VERSION = 2
 
 DEFAULT_PROMPT = """請為國際圖庫上架產生英文 metadata。
 
@@ -514,6 +515,7 @@ def preflight_api_call_count(config: RunConfig, images: list[Path]) -> int:
 
 def metadata_signature_for_config(config: RunConfig) -> str:
     payload = {
+        "schema_version": METADATA_SCHEMA_VERSION,
         "provider": config.provider.strip().lower(),
         "model": normalize_model_for_provider(config.provider, config.model),
         "prompt": config.prompt.strip(),
