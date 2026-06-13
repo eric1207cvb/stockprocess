@@ -1384,6 +1384,9 @@ def watch_folder(
                 progress("log", f"已達 {config.max_images} 張上限，停止監看。")
             break
 
+        if progress:
+            progress("watch_idle", {"count": len(results)})
+
         time.sleep(interval_seconds)
 
     if results and output_dir:
@@ -2517,6 +2520,18 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       margin-bottom: 7px;
     }}
     .filename {{ font-weight: 650; word-break: break-word; }}
+    .photo-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .photo-actions button {{
+      min-width: 74px;
+      padding: 6px 8px;
+      font-size: 12px;
+      line-height: 1.2;
+    }}
     .zh-summary {{
       min-width: 180px;
       max-width: 260px;
@@ -2594,6 +2609,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
     .ok {{ color: var(--ok); font-weight: 650; }}
     .processing {{ color: #b54708; font-weight: 650; }}
+    .pending {{ color: #175cd3; font-weight: 650; }}
+    .superseded {{ color: #667085; font-weight: 650; }}
     .error {{ color: var(--danger); font-weight: 650; }}
     @media (max-width: 960px) {{
       main {{ grid-template-columns: 1fr; height: auto; }}
@@ -2913,13 +2930,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
 
       const reanalyzeButton = event.target.closest('button[data-reanalyze-index]');
       if (reanalyzeButton) {{
-        if (lastStatus && lastStatus.running) {{
-          alert('請先按「停止」或等目前工作完成，再修正重辨單張照片。');
-          return;
-        }}
         const filename = reanalyzeButton.getAttribute('data-filename') || '這張照片';
         const correction = prompt(
-          '請輸入正確資訊，AI 會用同一張照片重新辨識。\\n例如：這張是鹹蛋苦瓜，不是炒高麗菜。',
+          '請輸入正確資訊。若 AI 正在工作，這張會先排到最後面，等目前任務完成後再重新辨識。\\n例如：這張是鹹蛋苦瓜，不是炒高麗菜。',
           ''
         );
         if (!correction || !correction.trim()) return;
@@ -2929,7 +2942,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           correction: correction.trim()
         }});
         await refresh();
-        alert('已送出修正重辨：' + filename);
+        alert('已排入修正重辨：' + filename);
         return;
       }}
 
@@ -2957,12 +2970,16 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     function localizedStatus(item) {{
       if (item.status === 'ok') return '完成';
       if (item.status === 'processing') return '修正中';
+      if (item.status === 'pending_reanalyze') return '待修正';
+      if (item.status === 'superseded') return '待移除';
       return '錯誤';
     }}
 
     function statusClass(item) {{
       if (item.status === 'ok') return 'ok';
       if (item.status === 'processing') return 'processing';
+      if (item.status === 'pending_reanalyze') return 'pending';
+      if (item.status === 'superseded') return 'superseded';
       return 'error';
     }}
 
@@ -3024,7 +3041,22 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       }}).join('');
     }}
 
+    function renderPhotoActions(item) {{
+      if (item.status === 'pending_reanalyze' || item.status === 'processing') {{
+        return '';
+      }}
+      const buttons = [];
+      if (item.status !== 'superseded') {{
+        buttons.push(`<button type="button" data-reanalyze-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">修正重辨</button>`);
+      }}
+      buttons.push(`<button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>`);
+      return `<div class="photo-actions">${{buttons.join('')}}</div>`;
+    }}
+
     function renderCopyButtons(item) {{
+      if (['pending_reanalyze', 'processing', 'superseded'].includes(item.status)) {{
+        return '';
+      }}
       const groups = itemKeywordGroups(item);
       const title = item.title || '';
       const description = item.description || '';
@@ -3039,8 +3071,6 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         buttons.push(`<button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>`);
       }});
       buttons.push(`<button type="button" data-copy="${{esc(item.copy_line || [title, description, (item.keywords || []).join(', ')].join('\\t'))}}">主整列</button>`);
-      buttons.push(`<button type="button" data-reanalyze-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">修正重辨</button>`);
-      buttons.push(`<button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>`);
       return buttons.join('');
     }}
 
@@ -3135,6 +3165,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
               <img class="row-thumb" src="${{esc(thumbnailSrc(item))}}" alt="">
               <div class="filename">${{esc(item.filename)}}</div>
               <div class="hint">#${{esc(item.index || '')}}</div>
+              ${{renderPhotoActions(item)}}
             </td>
             <td class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</td>
             <td class="zh-summary">${{esc(zhSummary(item))}}</td>
@@ -3196,6 +3227,8 @@ def run_web_gui(port: int = 8765) -> None:
         "current": current_progress_payload("待命"),
         "manifest": {},
         "mode": "",
+        "reanalyze_queue": [],
+        "next_reanalyze_id": 1,
         "running": False,
         "stop_event": None,
         "worker": None,
@@ -3212,7 +3245,7 @@ def run_web_gui(port: int = 8765) -> None:
         with state_lock:
             results_copy = list(app_state["results"])
             ok_count = len([result for result in results_copy if result.status == "ok"])
-            error_count = len([result for result in results_copy if result.status != "ok"])
+            error_count = len([result for result in results_copy if result.status == "error"])
             total = int(app_state["total"])
             done = int(app_state["done"])
             return {
@@ -3333,10 +3366,19 @@ def run_web_gui(port: int = 8765) -> None:
                     set_state(manifest=payload, state="監看中", done=count, total=total_limit, mode="watch")
                     set_current(current_progress_payload("監看中", total=total_limit))
                     add_log(f"目前批次完成，已處理 {count} 張；繼續監看新照片。")
+                    if has_reanalyze_queue():
+                        drain_reanalyze_queue(stop_event)
+                        set_state(state="監看中", mode="watch", running=True)
+                        set_current(current_progress_payload("監看中", total=total_limit))
                 else:
                     set_state(manifest=payload, state="完成")
                     set_current(current_progress_payload("完成", total=int(payload.get("count", 0) or 0)))
                     add_log("完成，結果已顯示在右側表格。")
+            elif kind == "watch_idle":
+                if watch_mode and has_reanalyze_queue():
+                    drain_reanalyze_queue(stop_event)
+                    set_state(state="監看中", mode="watch", running=True)
+                    set_current(current_progress_payload("監看中", total=config.max_images))
             elif kind == "done":
                 final_state = "已停止" if watch_mode and stop_event.is_set() else "完成"
                 set_state(manifest=payload, state=final_state)
@@ -3361,6 +3403,8 @@ def run_web_gui(port: int = 8765) -> None:
             set_current(current_progress_payload("錯誤"))
             add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
         finally:
+            if has_reanalyze_queue():
+                drain_reanalyze_queue(stop_event)
             set_state(running=False)
 
     def run_resume_job(config: RunConfig, stop_event: threading.Event) -> None:
@@ -3447,6 +3491,8 @@ def run_web_gui(port: int = 8765) -> None:
             set_current(current_progress_payload("錯誤"))
             add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
         finally:
+            if has_reanalyze_queue():
+                drain_reanalyze_queue(stop_event)
             set_state(running=False)
 
     def replace_result_by_index(target_index: int, replacement: ImageResult) -> bool:
@@ -3465,17 +3511,27 @@ def run_web_gui(port: int = 8765) -> None:
         target_index: int,
         correction: str,
         stop_event: threading.Event,
+        original_index: int = 0,
+        queue_id: str = "",
+        manage_running: bool = True,
     ) -> None:
         base_prompt = config.prompt
         api_key = ""
         metadata_signature = ""
         target: Optional[ImageResult] = None
+        queue_marker = f"修正重辨 {queue_id}" if queue_id else ""
         try:
             api_key = prepare_run(config)
             metadata_signature = metadata_signature_for_config(config)
             with state_lock:
                 for result in app_state["results"]:
-                    if int(result.index) == target_index:
+                    if queue_marker and queue_marker in (result.notes or "") and result.status in {
+                        "pending_reanalyze",
+                        "processing",
+                    }:
+                        target = result
+                        break
+                    if not queue_marker and int(result.index) == target_index:
                         target = result
                         break
                 if target is None:
@@ -3501,11 +3557,11 @@ def run_web_gui(port: int = 8765) -> None:
                 keywords=list(target.keywords or []),
                 keyword_groups=[dict(group) for group in (target.keyword_groups or [])],
                 categories=list(target.categories or []),
-                notes=f"修正資訊：{correction[:200]}",
+                notes=f"{queue_marker + '：' if queue_marker else ''}修正資訊：{correction[:200]}",
                 copy_line=target.copy_line,
                 prompt_signature=metadata_signature,
             )
-            replace_result_by_index(target_index, placeholder)
+            replace_result_by_index(target.index, placeholder)
 
             corrected_prompt = prompt_with_user_correction(base_prompt, image_path.name, correction)
             config.prompt = corrected_prompt
@@ -3583,8 +3639,19 @@ def run_web_gui(port: int = 8765) -> None:
                 copy_line=normalized["copy_line"],
                 prompt_signature=metadata_signature,
             )
-            replace_result_by_index(target_index, corrected)
             with state_lock:
+                current_results = list(app_state["results"])
+                replaced_results: list[ImageResult] = []
+                for result in current_results:
+                    if int(result.index) == int(target.index):
+                        replaced_results.append(corrected)
+                    elif queue_marker and queue_marker in (result.notes or "") and result.status == "superseded":
+                        continue
+                    elif original_index and int(result.index) == original_index and int(result.index) != int(target.index):
+                        continue
+                    else:
+                        replaced_results.append(result)
+                app_state["results"] = reindex_results(replaced_results)
                 source_token = completed_source_token_for_result(corrected)
                 if source_token:
                     app_state["completed_sources"].add(source_token)
@@ -3605,16 +3672,44 @@ def run_web_gui(port: int = 8765) -> None:
                     provider=config.provider,
                     model=config.model,
                     zh_summary="修正重辨失敗，請查看錯誤原因後再試一次。",
-                    notes=f"修正資訊：{correction[:200]}",
+                    notes=f"{queue_marker + '：' if queue_marker else ''}修正資訊：{correction[:200]}",
                     error=message,
                     prompt_signature=metadata_signature,
                 )
-                replace_result_by_index(target_index, failed)
+                replace_result_by_index(target.index, failed)
             set_current(current_progress_payload("修正重辨失敗"))
             set_state(state="修正失敗")
             add_log(f"[修正重辨] 錯誤：{message}")
         finally:
             config.prompt = base_prompt
+            if manage_running:
+                set_state(running=False)
+
+    def drain_reanalyze_queue(stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            with state_lock:
+                queue = app_state["reanalyze_queue"]
+                if not queue:
+                    return
+                item = queue.pop(0)
+            run_reanalyze_job(
+                item["config"],
+                int(item["pending_index"]),
+                str(item["correction"]),
+                stop_event,
+                original_index=int(item.get("original_index", 0) or 0),
+                queue_id=str(item.get("queue_id", "")),
+                manage_running=False,
+            )
+
+    def has_reanalyze_queue() -> bool:
+        with state_lock:
+            return bool(app_state["reanalyze_queue"])
+
+    def run_reanalyze_queue_worker(stop_event: threading.Event) -> None:
+        try:
+            drain_reanalyze_queue(stop_event)
+        finally:
             set_state(running=False)
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -3788,10 +3883,6 @@ def run_web_gui(port: int = 8765) -> None:
                     self.send_json({"ok": True})
                     return
                 if parsed.path == "/api/reanalyze-result":
-                    with state_lock:
-                        if app_state["running"]:
-                            self.send_json({"error": "請先按「停止」或等目前工作完成，再修正重辨單張照片。"}, 409)
-                            return
                     payload = self.read_json()
                     target_index = int(payload.get("index", 0) or 0)
                     correction = str(payload.get("correction", "")).strip()
@@ -3802,36 +3893,86 @@ def run_web_gui(port: int = 8765) -> None:
                         self.send_json({"error": "請輸入正確資訊，例如：這張是鹹蛋苦瓜，不是炒高麗菜。"}, 400)
                         return
                     config, _watch_mode = config_from_payload(payload)
-                    save_settings(
-                        {
-                            "folder": str(config.folder),
-                            "provider": config.provider,
-                            "model": config.model,
-                            "watch": False,
-                            "prompt": config.prompt,
-                            "prompt_name": str(payload.get("prompt_name", "default")).strip() or "default",
-                        }
-                    )
-                    stop_event = threading.Event()
+                    should_start_worker = False
+                    pending_index = 0
+                    queue_id = ""
                     with state_lock:
-                        app_state.update(
+                        current_results = list(app_state["results"])
+                        source = next(
+                            (result for result in current_results if int(result.index) == target_index),
+                            None,
+                        )
+                        if source is None:
+                            self.send_json({"error": "找不到要修正重辨的照片。"}, 404)
+                            return
+                        if source.status in {"pending_reanalyze", "processing", "superseded"}:
+                            self.send_json({"error": "這筆已經在修正重辨流程中。"}, 409)
+                            return
+                        queue_id = f"R{int(app_state['next_reanalyze_id'])}"
+                        app_state["next_reanalyze_id"] = int(app_state["next_reanalyze_id"]) + 1
+                        remove_completed_source_for_result(app_state["completed_sources"], source)
+                        source.status = "superseded"
+                        source.notes = f"修正重辨 {queue_id}：已排入修正，完成後移除此列。"
+                        pending_index = max([int(result.index) for result in current_results] or [0]) + 1
+                        pending = ImageResult(
+                            index=pending_index,
+                            filename=source.filename,
+                            source_path=source.source_path,
+                            status="pending_reanalyze",
+                            provider=config.provider,
+                            model=config.model,
+                            zh_summary="已排入修正重辨，會在目前任務之後執行。",
+                            notes=f"修正重辨 {queue_id}：{correction[:200]}",
+                            prompt_signature=metadata_signature_for_config(config),
+                        )
+                        app_state["results"].append(pending)
+                        app_state["results"] = reindex_results(list(app_state["results"]))
+                        pending_index = next(
+                            (
+                                int(result.index)
+                                for result in app_state["results"]
+                                if f"修正重辨 {queue_id}" in (result.notes or "")
+                                and result.status == "pending_reanalyze"
+                            ),
+                            pending_index,
+                        )
+                        app_state["reanalyze_queue"].append(
                             {
-                                "state": "準備修正重辨",
-                                "current": current_progress_payload("準備修正重辨", index=target_index, total=int(app_state["total"] or 0)),
-                                "mode": "reanalyze",
-                                "running": True,
-                                "stop_event": stop_event,
+                                "queue_id": queue_id,
+                                "original_index": int(source.index),
+                                "pending_index": pending_index,
+                                "correction": correction,
+                                "config": config,
                             }
                         )
-                    worker = threading.Thread(
-                        target=run_reanalyze_job,
-                        args=(config, target_index, correction, stop_event),
-                        daemon=True,
-                    )
-                    with state_lock:
-                        app_state["worker"] = worker
-                    worker.start()
-                    self.send_json({"ok": True})
+                        if not app_state["running"]:
+                            should_start_worker = True
+                            stop_event = threading.Event()
+                            app_state.update(
+                                {
+                                    "state": "準備修正重辨",
+                                    "current": current_progress_payload("準備修正重辨", index=pending_index, total=len(app_state["results"])),
+                                    "mode": "reanalyze",
+                                    "running": True,
+                                    "stop_event": stop_event,
+                                }
+                            )
+                        else:
+                            stop_event = app_state.get("stop_event") or threading.Event()
+                        results_copy = list(app_state["results"])
+                        completed_sources = set(app_state["completed_sources"])
+                    save_pending_results(results_copy, completed_sources)
+                    add_log(f"[修正重辨] 已排隊 {queue_id}：{source.filename}")
+                    if should_start_worker:
+                        worker = threading.Thread(
+                            target=run_reanalyze_queue_worker,
+                            args=(stop_event,),
+                            daemon=True,
+                        )
+                        with state_lock:
+                            app_state["worker"] = worker
+                        worker.start()
+                    self.send_json({"ok": True, "queued": True, "queue_id": queue_id, "pending_index": pending_index})
                     return
                 if parsed.path == "/api/save-prompt":
                     payload = self.read_json()
