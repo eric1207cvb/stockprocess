@@ -2549,10 +2549,34 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .keyword-group:last-child {{ border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }}
     .keyword-group-name {{ font-weight: 700; color: #344054; margin-bottom: 4px; }}
     .notes {{ max-width: 260px; }}
+    .actions {{
+      min-width: 280px;
+      max-width: 360px;
+    }}
+    .copy-panel {{
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }}
+    .copy-top-row {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }}
+    .copy-group {{
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(110px, 0.7fr);
+      gap: 6px;
+      align-items: stretch;
+    }}
+    .copy-divider {{
+      height: 1px;
+      background: var(--line);
+      margin: 2px 0;
+    }}
     .actions button {{
-      min-width: 86px;
-      max-width: 150px;
-      margin-bottom: 7px;
+      width: 100%;
+      min-width: 0;
       padding: 7px 9px;
       line-height: 1.25;
       overflow-wrap: anywhere;
@@ -2616,6 +2640,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       main {{ grid-template-columns: 1fr; height: auto; }}
       .right {{ grid-template-rows: auto minmax(320px, auto) auto; }}
       .logpanel .logwrap {{ max-height: 240px; }}
+      .actions {{ min-width: 0; max-width: none; }}
+      .copy-group {{ grid-template-columns: 1fr 1fr; }}
     }}
   </style>
 </head>
@@ -3062,18 +3088,30 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const groups = itemKeywordGroups(item);
       const title = item.title || '';
       const description = item.description || '';
-      const buttons = [
+      const topButtons = [
         `<button type="button" data-copy="${{esc(title)}}">標題</button>`,
         `<button type="button" data-copy="${{esc(description)}}">描述</button>`,
         `<button type="button" data-copy="${{esc([title, description].join('\\t'))}}">標題+描述</button>`
       ];
+      const groupRows = [];
       groups.forEach(group => {{
         const label = group.name || 'Keywords';
-        buttons.push(`<button type="button" data-copy="${{esc(groupKeywordText(group))}}">${{esc(label)}}關鍵字(${{group.keywords.length}})</button>`);
-        buttons.push(`<button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>`);
+        groupRows.push(`
+          <div class="copy-group">
+            <button type="button" data-copy="${{esc(groupKeywordText(group))}}">${{esc(label)}}關鍵字(${{group.keywords.length}})</button>
+            <button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>
+          </div>
+        `);
       }});
-      buttons.push(`<button type="button" data-copy="${{esc(item.copy_line || [title, description, (item.keywords || []).join(', ')].join('\\t'))}}">主整列</button>`);
-      return buttons.join('');
+      const mainLine = item.copy_line || [title, description, (item.keywords || []).join(', ')].join('\\t');
+      return `
+        <div class="copy-panel">
+          <div class="copy-top-row">${{topButtons.join('')}}</div>
+          <div class="copy-divider"></div>
+          ${{groupRows.join('')}}
+          <button type="button" data-copy="${{esc(mainLine)}}">主整列</button>
+        </div>
+      `;
     }}
 
     function formatDuration(seconds) {{
