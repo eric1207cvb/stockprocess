@@ -649,13 +649,13 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
   "zh_summary": "繁體中文一句話，說明照片主體與場景，只供使用者辨識照片，不放入圖庫 metadata",
   "keywords": ["依使用者指定語言與圖庫排序的 keyword 1", "keyword 2"],
   "keyword_groups": [
-    {
+    {{
       "name": "圖庫或規則名稱，例如 Adobe Stock / 日本圖庫",
       "language": "該組 keywords 的語言，例如 English / Japanese",
       "keywords": ["該組 keyword 1", "keyword 2"],
       "copy_line": "該組可直接貼上圖庫的內容",
       "notes": "該組規則的提醒；沒有則空字串"
-    }
+    }}
   ],
   "categories": ["category 1", "category 2"],
   "notes": "string",
