@@ -78,6 +78,7 @@ CONFIRM_API_CALLS_THRESHOLD = 25
 MAX_RETRY_COUNT = 3
 DEFAULT_MAX_FILE_MB = 64
 MAX_FILE_MB = 512
+MODEL_MAX_OUTPUT_TOKENS = 3000
 
 DEFAULT_PROMPT = """請為國際圖庫上架產生英文 metadata。
 
@@ -158,6 +159,10 @@ class ImageResult:
             "source_path": self.source_path,
             "thumbnail": self.thumbnail,
         }
+
+
+class ModelOutputFormatError(ValueError):
+    """Raised when a model response cannot be parsed as metadata JSON."""
 
 
 ProgressCallback = Callable[[str, Any], None]
@@ -337,12 +342,23 @@ def get_effective_api_key(provider: str, api_key: str) -> str:
     return os.environ.get(env_name, "").strip()
 
 
-def build_metadata_prompt(user_prompt: str, filename: str) -> str:
+def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bool = False) -> str:
     prompt = user_prompt.strip() or DEFAULT_PROMPT
+    retry_note = ""
+    if strict_json_retry:
+        retry_note = """
+前一次模型回應無法被程式解析。這次必須輸出完整有效 JSON：
+- 第一個字元必須是 {，最後一個字元必須是 }。
+- 不要 markdown，不要註解，不要在 JSON 前後加入任何文字。
+- 字串內需要換行時請使用 \\n，不要直接換行。
+- 必須保留 title、description、keywords、categories、notes、copy_line 這些 key。
+- 沒有資料時請用空字串或空陣列，不要省略 key。
+"""
     return f"""你是專業圖庫照片 metadata 標注員。請根據圖片內容與使用者需求產生可上架的資料。
 
 使用者需求：
 {prompt}
+{retry_note}
 
 檔名：{filename}
 
@@ -473,7 +489,7 @@ def call_openai(
                 "strict": True,
             }
         },
-        "max_output_tokens": 1400,
+        "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
     }
     response = post_json(
         "https://api.openai.com/v1/responses",
@@ -513,7 +529,8 @@ def call_gemini(
         "generationConfig": {
             "responseMimeType": "application/json",
             "responseJsonSchema": METADATA_JSON_SCHEMA,
-            "maxOutputTokens": 1400,
+            "maxOutputTokens": MODEL_MAX_OUTPUT_TOKENS,
+            "temperature": 0.2,
         },
     }
     response = post_json(
@@ -531,21 +548,26 @@ def parse_model_json(text: str) -> dict[str, Any]:
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\s*```$", "", raw)
 
+    decoder = json.JSONDecoder()
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        parsed, _ = decoder.raw_decode(raw)
+    except json.JSONDecodeError as first_error:
         start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError(f"模型回應不是 JSON：{raw[:300]}")
-        parsed = json.loads(raw[start : end + 1])
+        if start == -1:
+            raise ModelOutputFormatError(f"模型回應不是 JSON：{raw[:300]}") from first_error
+        try:
+            parsed, _ = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError as exc:
+            raise ModelOutputFormatError(
+                f"模型回應不是完整有效 JSON：{raw[:300]}"
+            ) from exc
 
     if isinstance(parsed, list):
         if not parsed:
-            raise ValueError("模型回應 JSON list 為空。")
+            raise ModelOutputFormatError("模型回應 JSON list 為空。")
         parsed = parsed[0]
     if not isinstance(parsed, dict):
-        raise ValueError("模型回應 JSON 不是 object。")
+        raise ModelOutputFormatError("模型回應 JSON 不是 object。")
     return parsed
 
 
@@ -590,8 +612,13 @@ def normalize_metadata(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def analyze_one_image(config: RunConfig, image_path: Path, api_key: str) -> dict[str, Any]:
-    prompt = build_metadata_prompt(config.prompt, image_path.name)
+def analyze_one_image(
+    config: RunConfig,
+    image_path: Path,
+    api_key: str,
+    strict_json_retry: bool = False,
+) -> dict[str, Any]:
+    prompt = build_metadata_prompt(config.prompt, image_path.name, strict_json_retry)
     if config.provider == "openai":
         return call_openai(
             image_path,
@@ -691,7 +718,12 @@ def analyze_images(
                 try:
                     ensure_daily_limit(config, 1)
                     record_api_attempt(config)
-                    raw_metadata = analyze_one_image(config, image_path, api_key)
+                    raw_metadata = analyze_one_image(
+                        config,
+                        image_path,
+                        api_key,
+                        strict_json_retry=isinstance(last_error, ModelOutputFormatError),
+                    )
                     break
                 except UsageLimitError:
                     raise
