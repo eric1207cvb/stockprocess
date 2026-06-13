@@ -2451,6 +2451,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
     .hint {{ color: var(--muted); font-size: 12px; line-height: 1.4; margin-top: 5px; }}
     .controls {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+    .run-controls {{ align-items: center; }}
     button {{
       border: 0;
       border-radius: 6px;
@@ -2515,6 +2516,46 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       background: #f0fdfa;
     }}
     .action-status.error {{
+      color: var(--danger);
+      border-color: #f5b7b1;
+      background: #fff7f6;
+    }}
+    .run-action-status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 36px;
+      max-width: 100%;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }}
+    .run-action-status.busy {{
+      color: #175cd3;
+      border-color: #bfdbfe;
+      background: #eff6ff;
+    }}
+    .run-action-status.busy::before {{
+      content: "";
+      width: 10px;
+      height: 10px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex: 0 0 auto;
+    }}
+    .run-action-status.success {{
+      color: var(--ok);
+      border-color: #99d8ce;
+      background: #f0fdfa;
+    }}
+    .run-action-status.error {{
       color: var(--danger);
       border-color: #f5b7b1;
       background: #fff7f6;
@@ -2839,9 +2880,10 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         <h2>4 執行</h2>
         <label><input name="watch" type="checkbox" style="width:auto" {watch_checked}> 監看資料夾</label>
         <div class="hint">預設最多處理 500 張照片；會保留 100 次 API 重試緩衝，仍有每日硬上限。</div>
-        <div class="controls">
+        <div class="controls run-controls">
           <button class="primary" type="submit" id="startBtn">開始</button>
           <button class="danger" type="button" id="stopBtn">停止</button>
+          <span id="runActionStatus" class="run-action-status idle">尚未開始</span>
         </div>
       </section>
     </form>
@@ -2916,6 +2958,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const keyStatus = document.getElementById('keyStatus');
     const pendingStatus = document.getElementById('pendingStatus');
     const serverStatus = document.getElementById('serverStatus');
+    const runActionStatus = document.getElementById('runActionStatus');
     const internalDefaults = {{
       max_images: {MAX_IMAGES},
       max_side: 1600,
@@ -2936,6 +2979,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     let copyStore = new Map();
     let copySeq = 0;
     let actionStatusTimer = 0;
+    let runActionStatusTimer = 0;
 
     function setActionStatus(message, tone = 'idle', holdMs = 0) {{
       window.clearTimeout(actionStatusTimer);
@@ -2946,6 +2990,36 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           serverStatus.textContent = lastStatus && lastStatus.running ? '工作執行中' : '本機瀏覽器介面';
           serverStatus.className = 'action-status idle';
         }}, holdMs);
+      }}
+    }}
+
+    function setRunActionStatus(message, tone = 'idle', holdMs = 0) {{
+      window.clearTimeout(runActionStatusTimer);
+      runActionStatus.textContent = message || '尚未開始';
+      runActionStatus.className = 'run-action-status ' + tone;
+      if (holdMs > 0) {{
+        runActionStatusTimer = window.setTimeout(() => syncRunActionStatus(lastStatus), holdMs);
+      }}
+    }}
+
+    function syncRunActionStatus(status) {{
+      if (!status) {{
+        setRunActionStatus('尚未開始', 'idle');
+        return;
+      }}
+      const current = status.current || {{}};
+      if (status.running) {{
+        setRunActionStatus(current.phase || status.state || '執行中', 'busy');
+        return;
+      }}
+      if (status.state === '完成') {{
+        setRunActionStatus('已完成', 'success');
+      }} else if (status.state === '錯誤' || status.state === '修正失敗') {{
+        setRunActionStatus('發生錯誤', 'error');
+      }} else if (status.state === '已停止') {{
+        setRunActionStatus('已停止', 'idle');
+      }} else {{
+        setRunActionStatus('尚未開始', 'idle');
       }}
     }}
 
@@ -3133,18 +3207,24 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     form.onsubmit = async (event) => {{
       event.preventDefault();
       const button = document.getElementById('startBtn');
-      await runAction(button, '啟動中...', '已開始，等待第一張照片狀態', async () => {{
+      setRunActionStatus('啟動中...', 'busy');
+      const result = await runAction(button, '啟動中...', '已開始，等待第一張照片狀態', async () => {{
         await postJson('/api/start', formPayload());
         await refresh();
-      }});
+        return {{ok: true}};
+      }}, {{holdMs: 900}});
+      if (!result) setRunActionStatus('啟動失敗', 'error', 4000);
     }};
 
     document.getElementById('stopBtn').onclick = async () => {{
       const button = document.getElementById('stopBtn');
-      await runAction(button, '停止中...', '已送出停止要求', async () => {{
+      setRunActionStatus('停止中...', 'busy');
+      const result = await runAction(button, '停止中...', '已送出停止要求', async () => {{
         await postJson('/api/stop');
         await refresh();
-      }});
+        return {{ok: true}};
+      }}, {{holdMs: 900}});
+      if (!result) setRunActionStatus('停止失敗', 'error', 4000);
     }};
     async function copyTextToClipboard(text) {{
       if (navigator.clipboard && window.isSecureContext) {{
@@ -3497,6 +3577,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         progress.max = Math.max(status.total || 1, 1);
         progress.value = status.done || 0;
         renderActivity(status);
+        syncRunActionStatus(status);
         const logs = status.logs || [];
         const logText = logs.join('\\n');
         if (logText !== lastLogText) {{
