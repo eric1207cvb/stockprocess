@@ -17,7 +17,11 @@
 
 ## 安裝
 
-每台新電腦只需要先安裝 Python 3.9 以上，之後執行啟動檔即可。啟動檔會自動檢查環境、建立 `.venv`、安裝/更新 requirements，然後開啟程式。
+每台新電腦只要執行啟動檔即可。啟動檔會先找 Python 3.9 以上；如果找不到，會詢問是否自動安裝 Python。Python 就緒後，啟動檔會自動建立 `.venv`、安裝/更新 requirements，然後開啟程式。
+
+- Windows 會優先使用 Microsoft `winget` 安裝 Python。
+- macOS 會優先使用 Homebrew 安裝 Python；若沒有 Homebrew，會詢問是否先安裝 Homebrew。
+- 若使用者拒絕安裝，或該電腦沒有可用的套件管理工具，請改到 Python 官網手動安裝。
 
 macOS:
 
@@ -31,7 +35,7 @@ Windows:
 .\start_windows.bat
 ```
 
-如果只想初始化環境、不啟動程式，可執行：
+如果已經有 Python，只想初始化環境、不啟動程式，可執行：
 
 ```bash
 python3 setup_environment.py
