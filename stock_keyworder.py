@@ -78,6 +78,8 @@ MAX_DAILY_API_LIMIT = 10000
 CONFIRM_API_CALLS_THRESHOLD = 25
 MAX_RETRY_COUNT = 3
 DEFAULT_RETRY_COUNT = 2
+CAPACITY_STOP_STREAK = 3
+CAPACITY_RETRY_DELAYS = [20, 45, 90]
 DEFAULT_MAX_FILE_MB = 64
 MAX_FILE_MB = 512
 MODEL_MAX_OUTPUT_TOKENS = 3000
@@ -98,12 +100,13 @@ METADATA_JSON_SCHEMA: dict[str, Any] = {
     "properties": {
         "title": {"type": "string"},
         "description": {"type": "string"},
+        "zh_summary": {"type": "string"},
         "keywords": {"type": "array", "items": {"type": "string"}},
         "categories": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "string"},
         "copy_line": {"type": "string"},
     },
-    "required": ["title", "description", "keywords", "categories", "notes", "copy_line"],
+    "required": ["title", "description", "zh_summary", "keywords", "categories", "notes", "copy_line"],
     "additionalProperties": False,
 }
 
@@ -137,6 +140,7 @@ class ImageResult:
     model: str
     title: str = ""
     description: str = ""
+    zh_summary: str = ""
     keywords: Optional[list[str]] = None
     categories: Optional[list[str]] = None
     notes: str = ""
@@ -151,6 +155,7 @@ class ImageResult:
             "status": self.status,
             "title": self.title,
             "description": self.description,
+            "zh_summary": self.zh_summary,
             "keywords": ", ".join(self.keywords or []),
             "categories": ", ".join(self.categories or []),
             "notes": self.notes,
@@ -172,6 +177,60 @@ ProgressCallback = Callable[[str, Any], None]
 
 class UsageLimitError(RuntimeError):
     pass
+
+
+class APIHTTPError(RuntimeError):
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(format_http_error(status_code, body))
+
+
+def format_http_error(status_code: int, body: str) -> str:
+    text = body[:1200]
+    lowered = text.lower()
+    if status_code == 503 and ("high demand" in lowered or "unavailable" in lowered):
+        return (
+            "模型目前滿載（HTTP 503 high demand）。"
+            "程式會用較長等待重試；若連續滿載會先暫停，稍後可按「繼續未完成」。"
+        )
+    if status_code == 429 or "rate limit" in lowered or "quota" in lowered:
+        return "API 速率或額度暫時受限。請稍後按「繼續未完成」，或降低批次量後再試。"
+    return redact_sensitive(f"HTTP {status_code}: {text}")
+
+
+def is_capacity_error(exc: BaseException) -> bool:
+    if isinstance(exc, APIHTTPError):
+        body = exc.body.lower()
+        return exc.status_code in {429, 500, 503, 529} and any(
+            marker in body
+            for marker in (
+                "high demand",
+                "unavailable",
+                "overloaded",
+                "rate limit",
+                "resource_exhausted",
+                "try again later",
+            )
+        )
+    text = str(exc).lower()
+    return any(marker in text for marker in ("http 503", "high demand", "unavailable", "rate limit"))
+
+
+def retry_wait_seconds(exc: BaseException, attempt: int) -> int:
+    if is_capacity_error(exc):
+        return CAPACITY_RETRY_DELAYS[min(attempt, len(CAPACITY_RETRY_DELAYS) - 1)]
+    if isinstance(exc, ModelOutputFormatError):
+        return 1 + attempt
+    return 2 + attempt * 2
+
+
+def wait_for_retry(seconds: int, stop_event: Optional[threading.Event]) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            return
+        time.sleep(min(0.5, max(deadline - time.time(), 0)))
 
 
 def provider_for_model(model: str) -> str:
@@ -353,7 +412,7 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
 - 第一個字元必須是 {，最後一個字元必須是 }。
 - 不要 markdown，不要註解，不要在 JSON 前後加入任何文字。
 - 字串內需要換行時請使用 \\n，不要直接換行。
-- 必須保留 title、description、keywords、categories、notes、copy_line 這些 key。
+- 必須保留 title、description、zh_summary、keywords、categories、notes、copy_line 這些 key。
 - 沒有資料時請用空字串或空陣列，不要省略 key。
 """
     return f"""你是專業圖庫照片 metadata 標注員。請根據圖片內容與使用者需求產生可上架的資料。
@@ -368,6 +427,7 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
 {{
   "title": "string",
   "description": "string",
+  "zh_summary": "繁體中文一句話，說明照片主體與場景，只供使用者辨識照片，不放入圖庫 metadata",
   "keywords": ["keyword 1", "keyword 2"],
   "categories": ["category 1", "category 2"],
   "notes": "string",
@@ -426,7 +486,7 @@ def post_json(
             return json.loads(response_body)
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(redact_sensitive(f"HTTP {exc.code}: {error_body[:1200]}")) from exc
+        raise APIHTTPError(exc.code, error_body) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(redact_sensitive(f"連線失敗：{exc.reason}")) from exc
 
@@ -598,15 +658,19 @@ def split_list(value: Any) -> list[str]:
 def normalize_metadata(data: dict[str, Any]) -> dict[str, Any]:
     title = str(data.get("title", "")).strip()
     description = str(data.get("description", "")).strip()
+    zh_summary = str(data.get("zh_summary", "")).strip()
     keywords = split_list(data.get("keywords"))
     categories = split_list(data.get("categories"))
     notes = str(data.get("notes", "")).strip()
     copy_line = str(data.get("copy_line", "")).strip()
     if not copy_line:
         copy_line = f"{title}\t{description}\t{', '.join(keywords)}"
+    if not zh_summary:
+        zh_summary = f"照片內容請參考英文標題：{title}" if title else "尚未產生中文說明。"
     return {
         "title": title,
         "description": description,
+        "zh_summary": zh_summary,
         "keywords": keywords,
         "categories": categories,
         "notes": notes,
@@ -682,6 +746,7 @@ def analyze_images(
 ) -> list[ImageResult]:
     results: list[ImageResult] = []
     total = total_count or len(images)
+    capacity_error_streak = 0
     for offset, image_path in enumerate(images):
         index = start_index + offset
         if stop_event and stop_event.is_set():
@@ -732,23 +797,28 @@ def analyze_images(
                 except Exception as exc:
                     last_error = exc
                     if attempt < config.retry_count:
-                        wait_seconds = 2 + attempt * 2
+                        wait_seconds = retry_wait_seconds(exc, attempt)
                         if progress:
                             progress(
                                 "log",
                                 f"  重試 {attempt + 1}/{config.retry_count}："
-                                f"{redact_sensitive(exc, [api_key, config.api_key])}",
+                                f"{redact_sensitive(exc, [api_key, config.api_key])} "
+                                f"等待 {wait_seconds} 秒",
                             )
-                        time.sleep(wait_seconds)
+                        wait_for_retry(wait_seconds, stop_event)
+                        if stop_event and stop_event.is_set():
+                            break
             if raw_metadata is None:
                 raise last_error or RuntimeError("分析失敗。")
             normalized = normalize_metadata(raw_metadata)
             result.title = normalized["title"]
             result.description = normalized["description"]
+            result.zh_summary = normalized["zh_summary"]
             result.keywords = normalized["keywords"]
             result.categories = normalized["categories"]
             result.notes = normalized["notes"]
             result.copy_line = normalized["copy_line"]
+            capacity_error_streak = 0
         except UsageLimitError as exc:
             result.status = "error"
             result.error = redact_sensitive(exc, [api_key, config.api_key])
@@ -761,11 +831,22 @@ def analyze_images(
         except Exception as exc:
             result.status = "error"
             result.error = redact_sensitive(exc, [api_key, config.api_key])
+            if is_capacity_error(exc):
+                capacity_error_streak += 1
+            else:
+                capacity_error_streak = 0
 
         results.append(result)
         if progress:
             progress("result", result)
             progress("progress", {"done": completed_before + len(results), "total": total})
+            if capacity_error_streak >= CAPACITY_STOP_STREAK:
+                progress(
+                    "log",
+                    f"模型連續 {capacity_error_streak} 張滿載或限流，已先暫停批次。"
+                    "請稍後按「繼續未完成」，或改用較穩定的模型。",
+                )
+                break
 
     return results
 
@@ -931,6 +1012,39 @@ def create_thumbnail(source: Path, destination: Path) -> Path:
     return fallback
 
 
+def create_thumbnail_response(source: Path, size: tuple[int, int] = (150, 104)) -> tuple[str, bytes]:
+    if PIL_AVAILABLE:
+        try:
+            with Image.open(source) as image:
+                image = ImageOps.exif_transpose(image)
+                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, (255, 255, 255))
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+
+                image.thumbnail(size, Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", size, (246, 247, 249))
+                x = (size[0] - image.width) // 2
+                y = (size[1] - image.height) // 2
+                canvas.paste(image, (x, y))
+                buffer = BytesIO()
+                canvas.save(buffer, format="JPEG", quality=72, optimize=True)
+                return "image/jpeg", buffer.getvalue()
+        except Exception:
+            pass
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="150" height="104">'
+        '<rect width="150" height="104" fill="#f2f4f7"/>'
+        '<text x="75" y="55" text-anchor="middle" font-family="sans-serif" '
+        'font-size="12" fill="#667085">No preview</text></svg>'
+    )
+    return "image/svg+xml; charset=utf-8", svg.encode("utf-8")
+
+
 def write_outputs(output_dir: Path, results: list[ImageResult], config: RunConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     thumbnail_dir = output_dir / "thumbnails"
@@ -953,6 +1067,7 @@ def write_outputs(output_dir: Path, results: list[ImageResult], config: RunConfi
         "status",
         "title",
         "description",
+        "zh_summary",
         "keywords",
         "categories",
         "notes",
@@ -1027,6 +1142,7 @@ def result_from_dict(data: dict[str, Any], fallback_index: int) -> ImageResult:
         model=str(data.get("model", "")),
         title=str(data.get("title", "")),
         description=str(data.get("description", "")),
+        zh_summary=str(data.get("zh_summary", "")),
         keywords=keywords if isinstance(keywords, list) else split_list(keywords),
         categories=categories if isinstance(categories, list) else split_list(categories),
         notes=str(data.get("notes", "")),
@@ -1176,6 +1292,7 @@ def build_html_report(results: list[ImageResult], payload: dict[str, Any]) -> st
               <td class="thumb"><img src="{html.escape(result.thumbnail, quote=True)}" alt=""></td>
               <td>
                 <div class="filename">{html.escape(result.filename)}</div>
+                <div class="description">{html.escape(result.zh_summary)}</div>
                 <div class="muted">{html.escape(result.source_path)}</div>
               </td>
               <td><span class="status {status_class}">{status_label}</span></td>
@@ -1767,6 +1884,33 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       font-size: 13px;
     }}
     th {{ background: #eef2f7; position: sticky; top: 0; }}
+    .photo-cell {{ min-width: 170px; max-width: 190px; }}
+    .row-thumb {{
+      width: 150px;
+      height: 104px;
+      object-fit: contain;
+      display: block;
+      background: #f2f4f7;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      margin-bottom: 7px;
+    }}
+    .filename {{ font-weight: 650; word-break: break-word; }}
+    .zh-summary {{
+      min-width: 180px;
+      max-width: 260px;
+      line-height: 1.45;
+      color: #344054;
+    }}
+    .title {{ font-weight: 650; margin-bottom: 6px; }}
+    .description, .keywords, .notes {{ line-height: 1.45; }}
+    .keywords {{ min-width: 260px; max-width: 360px; }}
+    .notes {{ max-width: 260px; }}
+    .actions button {{
+      width: 72px;
+      margin-bottom: 7px;
+      padding: 7px 9px;
+    }}
     .tablewrap, .logwrap {{
       min-height: 0;
       overflow: auto;
@@ -1873,7 +2017,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       </div>
       <div class="tablewrap">
         <table>
-          <thead><tr><th>檔名</th><th>狀態</th><th>Title</th><th>Description</th><th>Keywords</th><th>Notes</th><th>複製</th></tr></thead>
+          <thead><tr><th>照片 / 檔名</th><th>狀態</th><th>中文說明</th><th>Title / Description</th><th>Keywords</th><th>Notes</th><th>複製</th></tr></thead>
           <tbody id="results"></tbody>
         </table>
       </div>
@@ -2057,6 +2201,24 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       }}[ch]));
     }}
 
+    function thumbnailSrc(item) {{
+      return '/api/thumbnail?index=' + encodeURIComponent(item.index || 0);
+    }}
+
+    function localizedStatus(item) {{
+      return item.status === 'ok' ? '完成' : '錯誤';
+    }}
+
+    function zhSummary(item) {{
+      if (item.zh_summary) return item.zh_summary;
+      const message = String(item.notes || item.error || '');
+      if (/503|high demand|滿載|UNAVAILABLE/i.test(message)) {{
+        return '模型目前滿載，這張尚未完成；稍後按「繼續未完成」即可重新嘗試。';
+      }}
+      if (item.status !== 'ok') return '這張尚未完成，請查看錯誤原因後稍後續跑。';
+      return item.title ? '照片內容請參考英文標題：' + item.title : '尚未產生中文說明。';
+    }}
+
     async function refresh() {{
       const status = await fetch('/api/status').then(r => r.json());
       stateText.textContent = status.state || '待命';
@@ -2070,13 +2232,20 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         const copyLine = item.copy_line || [item.title || '', item.description || '', keywords].join('\\t');
         return `
           <tr>
-            <td>${{esc(item.filename)}}</td>
-            <td class="${{item.status === 'ok' ? 'ok' : 'error'}}">${{esc(item.status)}}</td>
-            <td>${{esc(item.title)}}</td>
-            <td>${{esc(item.description)}}</td>
-            <td>${{esc(keywords)}}</td>
-            <td>${{esc(item.notes || item.error || '')}}</td>
+            <td class="photo-cell">
+              <img class="row-thumb" src="${{esc(thumbnailSrc(item))}}" alt="">
+              <div class="filename">${{esc(item.filename)}}</div>
+              <div class="hint">#${{esc(item.index || '')}}</div>
+            </td>
+            <td class="${{item.status === 'ok' ? 'ok' : 'error'}}">${{esc(localizedStatus(item))}}</td>
+            <td class="zh-summary">${{esc(zhSummary(item))}}</td>
             <td>
+              <div class="title">${{esc(item.title)}}</div>
+              <div class="description">${{esc(item.description)}}</div>
+            </td>
+            <td class="keywords">${{esc(keywords)}}</td>
+            <td class="notes">${{esc(item.notes || item.error || '')}}</td>
+            <td class="actions">
               <button type="button" data-copy="${{esc(keywords)}}">關鍵字</button>
               <button type="button" data-copy="${{esc(copyLine)}}">整列</button>
               <button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>
@@ -2123,6 +2292,7 @@ def run_web_gui(port: int = 8765) -> None:
         "logs": [],
         "results": [],
         "completed_sources": set(),
+        "thumbnail_cache": {},
         "manifest": {},
         "running": False,
         "stop_event": None,
@@ -2147,6 +2317,36 @@ def run_web_gui(port: int = 8765) -> None:
                 "running": app_state["running"],
                 "manifest": dict(app_state["manifest"]),
             }
+
+    def thumbnail_for_index(index: int) -> tuple[str, bytes]:
+        with state_lock:
+            result = next(
+                (item for item in app_state["results"] if int(item.index) == index),
+                None,
+            )
+            cache = app_state["thumbnail_cache"]
+        if result is None:
+            raise FileNotFoundError("找不到縮圖。")
+
+        source = Path(result.source_path)
+        try:
+            stat = source.stat()
+            cache_key = f"{source_key_for_result(result)}:{stat.st_mtime_ns}:{stat.st_size}"
+        except Exception:
+            cache_key = source_key_for_result(result)
+
+        with state_lock:
+            cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        thumbnail = create_thumbnail_response(source)
+        with state_lock:
+            cache[cache_key] = thumbnail
+            if len(cache) > MAX_IMAGES:
+                for key in list(cache.keys())[: len(cache) - MAX_IMAGES]:
+                    cache.pop(key, None)
+        return thumbnail
 
     def set_state(**updates: Any) -> None:
         with state_lock:
@@ -2287,6 +2487,14 @@ def run_web_gui(port: int = 8765) -> None:
             self.end_headers()
             self.wfile.write(body)
 
+        def send_binary(self, body: bytes, content_type: str, status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
             if length <= 0:
@@ -2316,6 +2524,16 @@ def run_web_gui(port: int = 8765) -> None:
                 return
             if parsed.path == "/api/pending-status":
                 self.send_json(pending_results_status())
+                return
+            if parsed.path == "/api/thumbnail":
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    index = int((query.get("index") or ["0"])[0] or 0)
+                    content_type, body = thumbnail_for_index(index)
+                    self.send_binary(body, content_type)
+                except Exception:
+                    content_type, body = create_thumbnail_response(Path(""))
+                    self.send_binary(body, content_type, 404)
                 return
             self.send_json({"error": "Not found"}, 404)
 
@@ -2349,6 +2567,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "logs": [],
                                 "results": [],
                                 "completed_sources": set(),
+                                "thumbnail_cache": {},
                                 "manifest": {},
                                 "running": True,
                                 "stop_event": stop_event,
