@@ -6,7 +6,7 @@
 
 - 選擇照片資料夾後批次分析，單次上限 500 張。
 - 可切換 `openai` / `gemini` provider。
-- 可直接調整模型名稱，內建 `gpt-4o-mini`、`gpt-4o`、Gemini Flash / Flash-Lite 等常用選項與別名。
+- 可直接調整官方 API model ID，內建 `gpt-5.5`、`gpt-4o-mini`、`gpt-4o`、`gemini-3.1-flash-lite`、`gemini-3.5-flash` 等官方選項。
 - 可輸入自訂 prompt，對應各圖庫的 title、description、keywords 規則。
 - 可用監看模式，照片放入資料夾後自動加入分析佇列。
 - 單檔大小預設上限 64MB，超過會跳過且不呼叫 API。
@@ -124,7 +124,7 @@ python stock_keyworder.py --tk-gui
 GUI 介面分成四個區塊：
 
 - `1 照片來源`：可按 `選擇資料夾` 開啟系統資料夾選擇視窗，或手動貼上照片資料夾路徑。
-- `2 AI 模型`：選擇 OpenAI 或 Gemini、填入模型名稱與 API key。
+- `2 AI 模型`：選擇 OpenAI 或 Gemini、填入官方 API model ID 與 API key。
 - `3 圖庫需求 Prompt`：輸入圖庫規則，或套用通用模板後自行修改。
 - `4 執行`：選擇是否監看資料夾，並開始或停止分析；結果會直接顯示在右側表格。
 
@@ -145,7 +145,7 @@ GUI 介面分成四個區塊：
 7. 若某列因模型輸出格式錯誤而失敗，續跑時會移除該錯誤列並重新嘗試。
 8. 若 Gemini 顯示模型滿載，先等幾分鐘後按 `繼續未完成`；也可以改用下拉建議中的其他 Gemini 模型或 OpenAI。
 
-模型欄位可直接輸入模型名稱。OpenAI 可用 `gpt-4o-mini`；Gemini 可用官方 `gemini-3.1-flash-lite`，程式也接受 `3.1flash-light`、`3.1flash-lite` 這類常見輸入並自動轉成 `gemini-3.1-flash-lite`。若 API 回覆模型不存在，請改用下拉清單中同 provider 的其他模型。
+模型欄位使用官方 API model ID。OpenAI 下拉清單包含 `gpt-5.5`、`gpt-4o-mini`、`gpt-4o`；Gemini 下拉清單包含 `gemini-3.1-flash-lite`、`gemini-3.5-flash`、`gemini-3.1-pro-preview`、`gemini-3-flash-preview` 等官方 ID。程式仍接受 `3.1flash-light`、`3.1 pro` 這類常見輸入，但送出前會自動轉成官方 ID。
 
 重複或相似圖組的節省策略預設開啟。程式會先用本機縮圖雜湊比對已完成照片；距離在安全門檻內時，直接沿用前一張的 title、description、keywords 與 copy line，該張不會送 API。這適合連拍、同場景小幅構圖差異或同物件不同裁切；若照片內容其實不同，請在表格中刪除該列後調整 prompt 或關閉 CLI 的 `--no-reuse-similar` 重新跑。
 

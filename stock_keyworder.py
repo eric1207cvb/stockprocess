@@ -60,14 +60,15 @@ IMAGE_EXTENSIONS = {
 }
 PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-5.5",
-    "gemini": "gemini-3.5-flash",
+    "gemini": "gemini-3.1-flash-lite",
 }
 PROVIDER_MODEL_SUGGESTIONS = {
     "openai": ["gpt-5.5", "gpt-4o-mini", "gpt-4o"],
     "gemini": [
-        "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
-        "gemini-3-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.5-pro",
@@ -95,6 +96,16 @@ MODEL_ALIASES = {
     "3.1-flash-lite": "gemini-3.1-flash-lite",
     "gemini 3.1 flash lite": "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
+    "3.1pro": "gemini-3.1-pro-preview",
+    "3.1 pro": "gemini-3.1-pro-preview",
+    "gemini 3.1 pro": "gemini-3.1-pro-preview",
+    "gemini-3.1-pro": "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+    "3flash": "gemini-3-flash-preview",
+    "3 flash": "gemini-3-flash-preview",
+    "gemini 3 flash": "gemini-3-flash-preview",
+    "gemini-3-flash": "gemini-3-flash-preview",
+    "gemini-3-flash-preview": "gemini-3-flash-preview",
 }
 CONFIG_PATH = Path.home() / ".stock_keyworder_config.json"
 USAGE_PATH = Path.home() / ".stock_keyworder_usage.json"
@@ -2338,11 +2349,12 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
             </select>
           </div>
           <div>
-            <label>Model</label>
-            <input name="model" value="{model}" list="modelSuggestions">
+            <label>Model 官方 API ID</label>
+            <input name="model" value="{model}" list="modelSuggestions" placeholder="例如 gemini-3.1-flash-lite">
             <datalist id="modelSuggestions"></datalist>
           </div>
         </div>
+        <div class="hint">下拉清單只放官方 API model ID；常見短名稱會在送出前自動轉成官方 ID。</div>
         <label>API Key</label>
         <input name="api_key" type="password" autocomplete="off" placeholder="只保存在這次執行，不寫入設定檔">
         <label><input name="use_cached_api_key" type="checkbox" style="width:auto" checked> API Key 空白時使用本機暫存</label>
@@ -3560,7 +3572,7 @@ def run_gui() -> None:
             provider_box.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(8, 0))
             provider_box.bind("<<ComboboxSelected>>", self._provider_changed)
 
-            ttk.Label(model_box, text="Model", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+            ttk.Label(model_box, text="Model 官方 API ID", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
             ttk.Entry(model_box, textvariable=self.model_var).grid(
                 row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0)
             )
