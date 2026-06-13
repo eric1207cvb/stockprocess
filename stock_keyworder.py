@@ -14,6 +14,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import hashlib
 import html
 import http.server
 import json
@@ -203,6 +204,7 @@ class ImageResult:
     copy_line: str = ""
     error: str = ""
     thumbnail: str = ""
+    prompt_signature: str = ""
 
     def csv_row(self) -> dict[str, str]:
         return {
@@ -482,6 +484,39 @@ def preflight_api_call_count(config: RunConfig, images: list[Path]) -> int:
     return eligible_count
 
 
+def metadata_signature_for_config(config: RunConfig) -> str:
+    payload = {
+        "provider": config.provider.strip().lower(),
+        "model": normalize_model_for_provider(config.provider, config.model),
+        "prompt": config.prompt.strip(),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def result_matches_config(result: ImageResult, config: RunConfig) -> bool:
+    return bool(result.prompt_signature) and result.prompt_signature == metadata_signature_for_config(config)
+
+
+def completed_source_token(source_key: str, prompt_signature: str) -> str:
+    return f"{prompt_signature}:{source_key}"
+
+
+def completed_source_token_for_result(result: ImageResult) -> str:
+    source_key = source_key_for_result(result)
+    if not source_key:
+        return ""
+    if not result.prompt_signature:
+        return source_key
+    return completed_source_token(source_key, result.prompt_signature)
+
+
+def completed_source_paths_for_config(completed_sources: set[str], config: RunConfig) -> set[str]:
+    signature = metadata_signature_for_config(config)
+    prefix = f"{signature}:"
+    return {item[len(prefix) :] for item in completed_sources if item.startswith(prefix)}
+
+
 def file_limit_error(path: Path, max_file_mb: int) -> str:
     try:
         size_text = f"{file_size_mb(path):.1f} MB"
@@ -534,10 +569,10 @@ def clone_metadata_from_similar(result: ImageResult, source: ImageResult, distan
     )
 
 
-def seed_reuse_signatures(results: list[ImageResult]) -> list[tuple[int, ImageResult]]:
+def seed_reuse_signatures(results: list[ImageResult], config: RunConfig) -> list[tuple[int, ImageResult]]:
     signatures: list[tuple[int, ImageResult]] = []
     for result in results:
-        if result.status != "ok" or not result.source_path:
+        if result.status != "ok" or not result.source_path or not result_matches_config(result, config):
             continue
         signature = image_similarity_hash(Path(result.source_path))
         if signature is not None:
@@ -903,7 +938,8 @@ def analyze_images(
     results: list[ImageResult] = []
     total = total_count or len(images)
     capacity_error_streak = 0
-    reuse_signatures = seed_reuse_signatures(reuse_candidates or [])
+    metadata_signature = metadata_signature_for_config(config)
+    reuse_signatures = seed_reuse_signatures(reuse_candidates or [], config)
     for offset, image_path in enumerate(images):
         index = start_index + offset
         if stop_event and stop_event.is_set():
@@ -933,6 +969,7 @@ def analyze_images(
             model=config.model,
             keywords=[],
             categories=[],
+            prompt_signature=metadata_signature,
         )
 
         if not is_within_file_limit(image_path, config.max_file_mb):
@@ -1392,6 +1429,7 @@ def result_from_dict(data: dict[str, Any], fallback_index: int) -> ImageResult:
         copy_line=str(data.get("copy_line", "")),
         error=str(data.get("error", "")),
         thumbnail=str(data.get("thumbnail", "")),
+        prompt_signature=str(data.get("prompt_signature", "")),
     )
 
 
@@ -1421,11 +1459,16 @@ def is_completed_result(result: ImageResult) -> bool:
     return result.error.startswith("單檔大小")
 
 
-def completed_sources_from_results(results: list[ImageResult]) -> set[str]:
+def completed_sources_from_results(
+    results: list[ImageResult],
+    config: Optional[RunConfig] = None,
+) -> set[str]:
     return {
-        source_key_for_result(result)
+        completed_source_token_for_result(result)
         for result in results
-        if is_completed_result(result) and source_key_for_result(result)
+        if is_completed_result(result)
+        and completed_source_token_for_result(result)
+        and (config is None or result_matches_config(result, config))
     }
 
 
@@ -1435,12 +1478,16 @@ def discover_remaining_images(
     completed_sources: Optional[set[str]] = None,
 ) -> list[Path]:
     images = discover_images(config.folder, config.max_images)
-    skip_sources = set(completed_sources or set())
-    skip_sources.update(completed_sources_from_results(results))
+    skip_sources = completed_source_paths_for_config(set(completed_sources or set()), config)
+    skip_sources.update(
+        source_key_for_result(result)
+        for result in results
+        if is_completed_result(result) and result_matches_config(result, config) and source_key_for_result(result)
+    )
     skip_filenames = {
         result.filename.strip().casefold()
         for result in results
-        if is_completed_result(result) and result.filename.strip()
+        if is_completed_result(result) and result_matches_config(result, config) and result.filename.strip()
     }
     return [
         path
@@ -2729,7 +2776,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       log.textContent = (status.logs || []).join('\\n');
       log.parentElement.scrollTop = log.parentElement.scrollHeight;
       results.innerHTML = (status.results || []).map(item => {{
-        const keywords = (item.keywords || []).join(', ');
+        const keywordItems = item.keywords || [];
+        const keywords = keywordItems.join(', ');
         const copyLine = item.copy_line || [item.title || '', item.description || '', keywords].join('\\t');
         return `
           <tr>
@@ -2744,7 +2792,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
               <div class="title">${{esc(item.title)}}</div>
               <div class="description">${{esc(item.description)}}</div>
             </td>
-            <td class="keywords">${{esc(keywords)}}</td>
+            <td class="keywords"><div class="hint">${{keywordItems.length}} 個 keywords</div>${{esc(keywords)}}</td>
             <td class="notes">${{esc(item.notes || item.error || '')}}</td>
             <td class="actions">
               <button type="button" data-copy="${{esc(keywords)}}">關鍵字</button>
@@ -2922,9 +2970,9 @@ def run_web_gui(port: int = 8765) -> None:
                 with state_lock:
                     app_state["results"].append(payload)
                     if is_completed_result(payload):
-                        source_key = source_key_for_result(payload)
-                        if source_key:
-                            app_state["completed_sources"].add(source_key)
+                        source_token = completed_source_token_for_result(payload)
+                        if source_token:
+                            app_state["completed_sources"].add(source_token)
             elif kind in {"done", "saved"}:
                 set_state(manifest=payload, state="完成")
                 total_count = int(payload.get("count", 0) or 0)
@@ -2962,21 +3010,32 @@ def run_web_gui(port: int = 8765) -> None:
                 with state_lock:
                     app_state["results"].append(payload)
                     if is_completed_result(payload):
-                        source_key = source_key_for_result(payload)
-                        if source_key:
-                            app_state["completed_sources"].add(source_key)
+                        source_token = completed_source_token_for_result(payload)
+                        if source_token:
+                            app_state["completed_sources"].add(source_token)
 
         try:
             api_key = prepare_run(config)
             with state_lock:
                 all_existing_results = reindex_results(list(app_state["results"]))
-                existing_results = reindex_results(
-                    [result for result in all_existing_results if is_completed_result(result)]
+                stale_completed_count = len(
+                    [
+                        result
+                        for result in all_existing_results
+                        if is_completed_result(result) and not result_matches_config(result, config)
+                    ]
                 )
-                retryable_error_count = len(all_existing_results) - len(existing_results)
+                existing_results = reindex_results(
+                    [
+                        result
+                        for result in all_existing_results
+                        if is_completed_result(result) and result_matches_config(result, config)
+                    ]
+                )
+                retryable_error_count = len(all_existing_results) - len(existing_results) - stale_completed_count
                 completed_sources = set(app_state["completed_sources"])
                 app_state["results"] = existing_results
-                app_state["completed_sources"] = completed_sources | completed_sources_from_results(existing_results)
+                app_state["completed_sources"] = completed_sources | completed_sources_from_results(existing_results, config)
 
             remaining_images = discover_remaining_images(config, existing_results, completed_sources)
             total_count = len(existing_results) + len(remaining_images)
@@ -2991,6 +3050,11 @@ def run_web_gui(port: int = 8765) -> None:
             )
             if retryable_error_count:
                 add_log(f"續跑：移除 {retryable_error_count} 筆可重試錯誤，會重新分析。")
+            if stale_completed_count:
+                add_log(
+                    f"續跑：偵測到 prompt、provider 或 model 已變更，"
+                    f"移除 {stale_completed_count} 筆舊完成資料並重新分析。"
+                )
             add_log(f"續跑：已保留 {len(existing_results)} 筆完成資料，剩餘 {len(remaining_images)} 張未完成照片。")
 
             if remaining_images:
@@ -3172,7 +3236,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "done": len(current_results),
                                 "total": len(current_results),
                                 "results": reindex_results(current_results),
-                                "completed_sources": completed_sources | completed_sources_from_results(current_results),
+                                "completed_sources": completed_sources | completed_sources_from_results(current_results, config),
                                 "current": current_progress_payload("準備續跑", total=len(current_results)),
                                 "manifest": {},
                                 "running": True,
