@@ -2755,14 +2755,10 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .title {{ font-weight: 650; margin-bottom: 6px; }}
     .description, .keywords, .notes {{ line-height: 1.45; }}
     .title-description {{
-      max-height: 220px;
-      overflow: auto;
-      padding-right: 4px;
+      padding-right: 0;
     }}
     .keywords {{
-      max-height: 360px;
-      overflow: auto;
-      padding-right: 6px;
+      padding-right: 0;
     }}
     .keyword-group {{
       margin-bottom: 10px;
@@ -2772,10 +2768,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .keyword-group:last-child {{ border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }}
     .keyword-group-name {{ font-weight: 700; color: #344054; margin-bottom: 4px; }}
     .notes {{
-      max-height: 220px;
-      overflow: auto;
       color: #344054;
-      padding-right: 4px;
+      padding-right: 0;
     }}
     .actions {{
       min-width: 0;
@@ -2875,7 +2869,6 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         grid-template-columns: 1fr;
         min-width: 0;
       }}
-      .keywords, .notes, .title-description {{ max-height: none; }}
     }}
   </style>
 </head>
