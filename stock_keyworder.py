@@ -233,6 +233,29 @@ def wait_for_retry(seconds: int, stop_event: Optional[threading.Event]) -> None:
         time.sleep(min(0.5, max(deadline - time.time(), 0)))
 
 
+def current_progress_payload(
+    phase: str,
+    filename: str = "",
+    index: int = 0,
+    total: int = 0,
+    attempt: int = 0,
+    max_attempts: int = 0,
+    retry_until: float = 0,
+) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "phase": phase,
+        "filename": filename,
+        "index": index,
+        "total": total,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "retry_until": retry_until,
+        "started_at": now,
+        "updated_at": now,
+    }
+
+
 def provider_for_model(model: str) -> str:
     text = model.strip().lower()
     if text.startswith("gemini-"):
@@ -756,6 +779,16 @@ def analyze_images(
 
         if progress:
             progress("log", f"[{index}/{total}] 分析 {image_path.name}")
+            progress(
+                "current",
+                current_progress_payload(
+                    "準備分析",
+                    image_path.name,
+                    index,
+                    total,
+                    max_attempts=config.retry_count + 1,
+                ),
+            )
 
         result = ImageResult(
             index=index,
@@ -773,6 +806,10 @@ def analyze_images(
             result.error = file_limit_error(image_path, config.max_file_mb)
             results.append(result)
             if progress:
+                progress(
+                    "current",
+                    current_progress_payload("跳過過大檔案", image_path.name, index, total),
+                )
                 progress("result", result)
                 progress("progress", {"done": completed_before + len(results), "total": total})
                 progress("log", f"  跳過 {image_path.name}：{result.error}")
@@ -785,6 +822,19 @@ def analyze_images(
                 try:
                     ensure_daily_limit(config, 1)
                     record_api_attempt(config)
+                    if progress:
+                        phase = "送出 API 分析中" if attempt == 0 else "重新送出 API"
+                        progress(
+                            "current",
+                            current_progress_payload(
+                                phase,
+                                image_path.name,
+                                index,
+                                total,
+                                attempt=attempt + 1,
+                                max_attempts=config.retry_count + 1,
+                            ),
+                        )
                     raw_metadata = analyze_one_image(
                         config,
                         image_path,
@@ -798,7 +848,20 @@ def analyze_images(
                     last_error = exc
                     if attempt < config.retry_count:
                         wait_seconds = retry_wait_seconds(exc, attempt)
+                        retry_until = time.time() + wait_seconds
                         if progress:
+                            progress(
+                                "current",
+                                current_progress_payload(
+                                    "等待重試",
+                                    image_path.name,
+                                    index,
+                                    total,
+                                    attempt=attempt + 1,
+                                    max_attempts=config.retry_count + 1,
+                                    retry_until=retry_until,
+                                ),
+                            )
                             progress(
                                 "log",
                                 f"  重試 {attempt + 1}/{config.retry_count}："
@@ -819,11 +882,20 @@ def analyze_images(
             result.notes = normalized["notes"]
             result.copy_line = normalized["copy_line"]
             capacity_error_streak = 0
+            if progress:
+                progress(
+                    "current",
+                    current_progress_payload("完成本張", image_path.name, index, total),
+                )
         except UsageLimitError as exc:
             result.status = "error"
             result.error = redact_sensitive(exc, [api_key, config.api_key])
             results.append(result)
             if progress:
+                progress(
+                    "current",
+                    current_progress_payload("已達 API 上限", image_path.name, index, total),
+                )
                 progress("result", result)
                 progress("progress", {"done": completed_before + len(results), "total": total})
                 progress("log", result.error)
@@ -835,6 +907,11 @@ def analyze_images(
                 capacity_error_streak += 1
             else:
                 capacity_error_streak = 0
+            if progress:
+                progress(
+                    "current",
+                    current_progress_payload("本張失敗", image_path.name, index, total),
+                )
 
         results.append(result)
         if progress:
@@ -1869,6 +1946,83 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       border-radius: 8px;
       padding: 14px;
     }}
+    .activity {{
+      margin-top: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+    }}
+    .activity-main {{
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      flex-wrap: wrap;
+      font-weight: 650;
+    }}
+    .activity-dot {{
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      display: inline-block;
+      flex: 0 0 auto;
+    }}
+    .activity-dot.running {{
+      background: var(--primary);
+      box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.55);
+      animation: pulse 1.3s infinite;
+    }}
+    .activity-dot.waiting {{
+      background: #b54708;
+      box-shadow: 0 0 0 0 rgba(181, 71, 8, 0.45);
+      animation: pulse 1.3s infinite;
+    }}
+    .activity-dot.error {{ background: var(--danger); }}
+    @keyframes pulse {{
+      0% {{ box-shadow: 0 0 0 0 currentColor; }}
+      70% {{ box-shadow: 0 0 0 8px rgba(255,255,255,0); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(255,255,255,0); }}
+    }}
+    .activity-file {{
+      margin-top: 6px;
+      color: #344054;
+      word-break: break-word;
+      line-height: 1.4;
+    }}
+    .activity-sub {{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }}
+    .retry-line {{
+      margin-top: 7px;
+      color: #b54708;
+      font-weight: 650;
+      font-size: 12px;
+    }}
+    .stats-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(90px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .stat-box {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fff;
+    }}
+    .stat-label {{
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 3px;
+    }}
+    .stat-value {{
+      font-weight: 700;
+      font-size: 15px;
+    }}
     progress {{ width: 100%; height: 14px; margin-top: 8px; }}
     table {{
       width: 100%;
@@ -2014,6 +2168,22 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           </div>
         </div>
         <progress id="progress" value="0" max="1"></progress>
+        <div class="activity">
+          <div class="activity-main">
+            <span id="activityDot" class="activity-dot"></span>
+            <span id="currentPhase">待命</span>
+            <span id="currentElapsed" class="hint"></span>
+          </div>
+          <div id="currentFile" class="activity-file">尚未開始。</div>
+          <div id="currentSub" class="activity-sub">開始後會顯示目前處理到哪張照片與 API 狀態。</div>
+          <div id="retryLine" class="retry-line"></div>
+          <div class="stats-grid">
+            <div class="stat-box"><div class="stat-label">完成</div><div id="okStat" class="stat-value">0</div></div>
+            <div class="stat-box"><div class="stat-label">錯誤</div><div id="errorStat" class="stat-value">0</div></div>
+            <div class="stat-box"><div class="stat-label">剩餘</div><div id="remainingStat" class="stat-value">0</div></div>
+            <div class="stat-box"><div class="stat-label">進度</div><div id="percentStat" class="stat-value">0%</div></div>
+          </div>
+        </div>
       </div>
       <div class="tablewrap">
         <table>
@@ -2031,6 +2201,16 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const stateText = document.getElementById('stateText');
     const countText = document.getElementById('countText');
     const progress = document.getElementById('progress');
+    const activityDot = document.getElementById('activityDot');
+    const currentPhase = document.getElementById('currentPhase');
+    const currentElapsed = document.getElementById('currentElapsed');
+    const currentFile = document.getElementById('currentFile');
+    const currentSub = document.getElementById('currentSub');
+    const retryLine = document.getElementById('retryLine');
+    const okStat = document.getElementById('okStat');
+    const errorStat = document.getElementById('errorStat');
+    const remainingStat = document.getElementById('remainingStat');
+    const percentStat = document.getElementById('percentStat');
     const results = document.getElementById('results');
     const log = document.getElementById('log');
     const promptList = document.getElementById('promptList');
@@ -2046,6 +2226,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const providerDefaults = {json.dumps(PROVIDER_DEFAULT_MODELS, ensure_ascii=False)};
     const providerModels = {json.dumps(PROVIDER_MODEL_SUGGESTIONS, ensure_ascii=False)};
     const knownProviders = Object.keys(providerDefaults);
+    let lastStatus = null;
+    let serverOffsetSeconds = 0;
 
     document.getElementById('defaultPrompt').onclick = () => form.prompt.value = defaultPrompt;
     document.getElementById('savePromptBtn').onclick = async () => {{
@@ -2219,12 +2401,72 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       return item.title ? '照片內容請參考英文標題：' + item.title : '尚未產生中文說明。';
     }}
 
+    function formatDuration(seconds) {{
+      const total = Math.max(0, Math.floor(Number(seconds) || 0));
+      const minutes = Math.floor(total / 60);
+      const secs = total % 60;
+      if (minutes <= 0) return secs + ' 秒';
+      return minutes + ' 分 ' + String(secs).padStart(2, '0') + ' 秒';
+    }}
+
+    function browserServerNow() {{
+      return Date.now() / 1000 + serverOffsetSeconds;
+    }}
+
+    function renderActivity(status) {{
+      const current = status.current || {{}};
+      const now = browserServerNow();
+      const total = Number(status.total || current.total || 0);
+      const done = Number(status.done || 0);
+      const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+      const phase = current.phase || status.state || '待命';
+      const retryRemaining = current.retry_until ? Math.max(0, Math.ceil(Number(current.retry_until) - now)) : 0;
+      const startedAt = Number(current.started_at || current.updated_at || now);
+      const elapsed = Math.max(0, now - startedAt);
+
+      currentPhase.textContent = phase;
+      currentElapsed.textContent = status.running ? '已等待 ' + formatDuration(elapsed) : '';
+      if (current.filename) {{
+        currentFile.textContent = '第 ' + (current.index || '-') + ' / ' + (current.total || total || '-') + ' 張：' + current.filename;
+      }} else {{
+        currentFile.textContent = status.running ? '正在準備工作。' : '尚未開始。';
+      }}
+
+      const attempts = current.max_attempts
+        ? 'API 嘗試 ' + (current.attempt || 1) + ' / ' + current.max_attempts
+        : '';
+      currentSub.textContent = attempts || (status.running ? '程式仍在執行，請等候目前 API 回應。' : '開始後會顯示目前處理到哪張照片與 API 狀態。');
+
+      retryLine.textContent = retryRemaining > 0
+        ? '模型忙碌或暫時限流，' + retryRemaining + ' 秒後自動重試。'
+        : '';
+
+      activityDot.className = 'activity-dot';
+      if (status.state === '錯誤') {{
+        activityDot.classList.add('error');
+      }} else if (retryRemaining > 0 || /等待/.test(phase)) {{
+        activityDot.classList.add('waiting');
+      }} else if (status.running) {{
+        activityDot.classList.add('running');
+      }}
+
+      okStat.textContent = status.ok_count || 0;
+      errorStat.textContent = status.error_count || 0;
+      remainingStat.textContent = status.remaining || 0;
+      percentStat.textContent = percent + '%';
+    }}
+
     async function refresh() {{
       const status = await fetch('/api/status').then(r => r.json());
+      lastStatus = status;
+      if (status.server_time) {{
+        serverOffsetSeconds = Number(status.server_time) - Date.now() / 1000;
+      }}
       stateText.textContent = status.state || '待命';
       countText.textContent = ' ' + (status.done || 0) + ' / ' + (status.total || 0);
       progress.max = Math.max(status.total || 1, 1);
       progress.value = status.done || 0;
+      renderActivity(status);
       log.textContent = (status.logs || []).join('\\n');
       log.parentElement.scrollTop = log.parentElement.scrollHeight;
       results.innerHTML = (status.results || []).map(item => {{
@@ -2272,6 +2514,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         : '';
     }}
     setInterval(refresh, 900);
+    setInterval(() => {{
+      if (lastStatus) renderActivity(lastStatus);
+    }}, 500);
     syncModelForProvider();
     refreshModelSuggestions();
     loadPromptList();
@@ -2293,6 +2538,7 @@ def run_web_gui(port: int = 8765) -> None:
         "results": [],
         "completed_sources": set(),
         "thumbnail_cache": {},
+        "current": current_progress_payload("待命"),
         "manifest": {},
         "running": False,
         "stop_event": None,
@@ -2308,13 +2554,23 @@ def run_web_gui(port: int = 8765) -> None:
 
     def snapshot() -> dict[str, Any]:
         with state_lock:
+            results_copy = list(app_state["results"])
+            ok_count = len([result for result in results_copy if result.status == "ok"])
+            error_count = len([result for result in results_copy if result.status != "ok"])
+            total = int(app_state["total"])
+            done = int(app_state["done"])
             return {
                 "state": app_state["state"],
-                "done": app_state["done"],
-                "total": app_state["total"],
+                "done": done,
+                "total": total,
+                "ok_count": ok_count,
+                "error_count": error_count,
+                "remaining": max(total - done, 0),
                 "logs": list(app_state["logs"]),
-                "results": [asdict(result) for result in app_state["results"]],
+                "results": [asdict(result) for result in results_copy],
                 "running": app_state["running"],
+                "current": dict(app_state["current"]),
+                "server_time": time.time(),
                 "manifest": dict(app_state["manifest"]),
             }
 
@@ -2352,6 +2608,13 @@ def run_web_gui(port: int = 8765) -> None:
         with state_lock:
             app_state.update(updates)
 
+    def set_current(payload: dict[str, Any]) -> None:
+        current = dict(payload)
+        current.setdefault("updated_at", time.time())
+        current.setdefault("started_at", current["updated_at"])
+        with state_lock:
+            app_state["current"] = current
+
     def config_from_payload(payload: dict[str, Any]) -> tuple[RunConfig, bool]:
         provider = str(payload.get("provider", "openai")).strip().lower()
         model = normalize_model_for_provider(
@@ -2386,9 +2649,12 @@ def run_web_gui(port: int = 8765) -> None:
         def progress(kind: str, payload: Any) -> None:
             if kind == "scan":
                 set_state(total=int(payload["total"]), done=0, state="執行中")
+                set_current(current_progress_payload("掃描完成，準備開始", total=int(payload["total"])))
                 add_log(f"找到/上限 {payload['total']} 張")
             elif kind == "log":
                 add_log(redact_sensitive(payload, [config.api_key]))
+            elif kind == "current":
+                set_current(payload)
             elif kind == "progress":
                 set_state(done=int(payload["done"]), total=int(payload["total"]))
             elif kind == "result":
@@ -2400,6 +2666,11 @@ def run_web_gui(port: int = 8765) -> None:
                             app_state["completed_sources"].add(source_key)
             elif kind in {"done", "saved"}:
                 set_state(manifest=payload, state="完成")
+                total_count = int(payload.get("count", 0) or 0)
+                if not total_count:
+                    with state_lock:
+                        total_count = int(app_state["total"])
+                set_current(current_progress_payload("完成", total=total_count))
                 if payload.get("html"):
                     add_log(f"報表：{payload.get('html', '')}")
                 else:
@@ -2413,6 +2684,7 @@ def run_web_gui(port: int = 8765) -> None:
             set_state(manifest=manifest, state="完成")
         except Exception as exc:
             set_state(state="錯誤")
+            set_current(current_progress_payload("錯誤"))
             add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
         finally:
             set_state(running=False)
@@ -2421,6 +2693,8 @@ def run_web_gui(port: int = 8765) -> None:
         def progress(kind: str, payload: Any) -> None:
             if kind == "log":
                 add_log(redact_sensitive(payload, [config.api_key]))
+            elif kind == "current":
+                set_current(payload)
             elif kind == "progress":
                 set_state(done=int(payload["done"]), total=int(payload["total"]))
             elif kind == "result":
@@ -2447,6 +2721,13 @@ def run_web_gui(port: int = 8765) -> None:
             total_count = len(existing_results) + len(remaining_images)
             ensure_daily_limit(config, count_api_eligible_images(remaining_images, config.max_file_mb))
             set_state(total=total_count, done=len(existing_results), state="執行中")
+            set_current(
+                current_progress_payload(
+                    "準備續跑",
+                    index=len(existing_results),
+                    total=total_count,
+                )
+            )
             if retryable_error_count:
                 add_log(f"續跑：移除 {retryable_error_count} 筆可重試錯誤，會重新分析。")
             add_log(f"續跑：已保留 {len(existing_results)} 筆完成資料，剩餘 {len(remaining_images)} 張未完成照片。")
@@ -2468,9 +2749,11 @@ def run_web_gui(port: int = 8765) -> None:
                 app_state["results"] = final_results
             manifest = build_result_manifest(final_results, config)
             set_state(manifest=manifest, state="完成")
+            set_current(current_progress_payload("完成", total=len(final_results)))
             add_log("續跑完成，結果已顯示在右側表格。")
         except Exception as exc:
             set_state(state="錯誤")
+            set_current(current_progress_payload("錯誤"))
             add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
         finally:
             set_state(running=False)
@@ -2568,6 +2851,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "results": [],
                                 "completed_sources": set(),
                                 "thumbnail_cache": {},
+                                "current": current_progress_payload("準備中"),
                                 "manifest": {},
                                 "running": True,
                                 "stop_event": stop_event,
@@ -2623,6 +2907,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "total": len(current_results),
                                 "results": reindex_results(current_results),
                                 "completed_sources": completed_sources | completed_sources_from_results(current_results),
+                                "current": current_progress_payload("準備續跑", total=len(current_results)),
                                 "manifest": {},
                                 "running": True,
                                 "stop_event": stop_event,
@@ -2666,6 +2951,7 @@ def run_web_gui(port: int = 8765) -> None:
                     with state_lock:
                         results_copy = list(app_state["results"])
                         completed_sources = set(app_state["completed_sources"])
+                        app_state["current"] = current_progress_payload("已儲存進度", total=len(results_copy))
                     self.send_json(save_pending_results(results_copy, completed_sources))
                     return
                 if parsed.path == "/api/load-progress":
@@ -2683,6 +2969,7 @@ def run_web_gui(port: int = 8765) -> None:
                         app_state["total"] = len(pending_results)
                         app_state["completed_sources"] = completed_sources
                         app_state["state"] = "已載入進度"
+                        app_state["current"] = current_progress_payload("已載入進度", total=len(pending_results))
                         app_state["manifest"] = {}
                     add_log(f"已載入 {len(pending_results)} 筆進度。")
                     self.send_json({"ok": True, "count": len(pending_results)})
@@ -2700,6 +2987,7 @@ def run_web_gui(port: int = 8765) -> None:
                         if not app_state["running"]:
                             app_state["done"] = len(app_state["results"])
                             app_state["total"] = len(app_state["results"])
+                            app_state["current"] = current_progress_payload("已刪除一筆", total=len(app_state["results"]))
                         results_copy = list(app_state["results"])
                         completed_sources = set(app_state["completed_sources"])
                     saved = save_pending_results(results_copy, completed_sources)
@@ -2711,6 +2999,7 @@ def run_web_gui(port: int = 8765) -> None:
                         stop_event = app_state.get("stop_event")
                     if stop_event:
                         stop_event.set()
+                    set_current(current_progress_payload("停止中"))
                     add_log("收到停止要求。")
                     self.send_json({"ok": True})
                     return
