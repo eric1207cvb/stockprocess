@@ -541,6 +541,19 @@ def completed_source_token_for_result(result: ImageResult) -> str:
     return completed_source_token(source_key, result.prompt_signature)
 
 
+def remove_completed_source_for_result(completed_sources: set[str], result: ImageResult) -> None:
+    source_key = source_key_for_result(result)
+    if not source_key:
+        return
+    completed_sources.difference_update(
+        {
+            item
+            for item in completed_sources
+            if item == source_key or item.endswith(f":{source_key}")
+        }
+    )
+
+
 def completed_source_paths_for_config(completed_sources: set[str], config: RunConfig) -> set[str]:
     signature = metadata_signature_for_config(config)
     prefix = f"{signature}:"
@@ -662,6 +675,16 @@ def build_metadata_prompt(user_prompt: str, filename: str, strict_json_retry: bo
   "copy_line": "title<TAB>description<TAB>keyword1, keyword2, keyword3"
 }}
 """
+
+
+def prompt_with_user_correction(base_prompt: str, filename: str, correction: str) -> str:
+    clean_correction = correction.strip()
+    return f"""{base_prompt.strip() or DEFAULT_PROMPT}
+
+針對檔名 {filename} 的使用者修正資訊：
+{clean_correction}
+
+請以這段使用者修正資訊為最高優先。若修正資訊指出主體、菜名、地點、人物、物件或錯誤辨識，請依修正後的內容重新產生 title、description、zh_summary、keyword_groups、keywords 與 copy_line，不要沿用舊的錯誤辨識。"""
 
 
 def load_image_for_api(path: Path, max_side: int) -> tuple[str, bytes]:
@@ -2570,6 +2593,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       line-height: 1.45;
     }}
     .ok {{ color: var(--ok); font-weight: 650; }}
+    .processing {{ color: #b54708; font-weight: 650; }}
     .error {{ color: var(--danger); font-weight: 650; }}
     @media (max-width: 960px) {{
       main {{ grid-template-columns: 1fr; height: auto; }}
@@ -2887,6 +2911,28 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         return;
       }}
 
+      const reanalyzeButton = event.target.closest('button[data-reanalyze-index]');
+      if (reanalyzeButton) {{
+        if (lastStatus && lastStatus.running) {{
+          alert('請先按「停止」或等目前工作完成，再修正重辨單張照片。');
+          return;
+        }}
+        const filename = reanalyzeButton.getAttribute('data-filename') || '這張照片';
+        const correction = prompt(
+          '請輸入正確資訊，AI 會用同一張照片重新辨識。\\n例如：這張是鹹蛋苦瓜，不是炒高麗菜。',
+          ''
+        );
+        if (!correction || !correction.trim()) return;
+        await postJson('/api/reanalyze-result', {{
+          ...formPayload(),
+          index: Number(reanalyzeButton.getAttribute('data-reanalyze-index') || 0),
+          correction: correction.trim()
+        }});
+        await refresh();
+        alert('已送出修正重辨：' + filename);
+        return;
+      }}
+
       const deleteButton = event.target.closest('button[data-delete-index]');
       if (!deleteButton) return;
       const filename = deleteButton.getAttribute('data-filename') || '此筆資料';
@@ -2909,7 +2955,15 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
 
     function localizedStatus(item) {{
-      return item.status === 'ok' ? '完成' : '錯誤';
+      if (item.status === 'ok') return '完成';
+      if (item.status === 'processing') return '修正中';
+      return '錯誤';
+    }}
+
+    function statusClass(item) {{
+      if (item.status === 'ok') return 'ok';
+      if (item.status === 'processing') return 'processing';
+      return 'error';
     }}
 
     function zhSummary(item) {{
@@ -2985,6 +3039,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         buttons.push(`<button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>`);
       }});
       buttons.push(`<button type="button" data-copy="${{esc(item.copy_line || [title, description, (item.keywords || []).join(', ')].join('\\t'))}}">主整列</button>`);
+      buttons.push(`<button type="button" data-reanalyze-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">修正重辨</button>`);
       buttons.push(`<button type="button" data-delete-index="${{esc(item.index)}}" data-filename="${{esc(item.filename)}}">刪除</button>`);
       return buttons.join('');
     }}
@@ -3081,7 +3136,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
               <div class="filename">${{esc(item.filename)}}</div>
               <div class="hint">#${{esc(item.index || '')}}</div>
             </td>
-            <td class="${{item.status === 'ok' ? 'ok' : 'error'}}">${{esc(localizedStatus(item))}}</td>
+            <td class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</td>
             <td class="zh-summary">${{esc(zhSummary(item))}}</td>
             <td>
               <div class="title">${{esc(item.title)}}</div>
@@ -3394,6 +3449,174 @@ def run_web_gui(port: int = 8765) -> None:
         finally:
             set_state(running=False)
 
+    def replace_result_by_index(target_index: int, replacement: ImageResult) -> bool:
+        with state_lock:
+            current_results = list(app_state["results"])
+            for position, existing in enumerate(current_results):
+                if int(existing.index) == target_index:
+                    replacement.index = existing.index
+                    current_results[position] = replacement
+                    app_state["results"] = reindex_results(current_results)
+                    return True
+        return False
+
+    def run_reanalyze_job(
+        config: RunConfig,
+        target_index: int,
+        correction: str,
+        stop_event: threading.Event,
+    ) -> None:
+        base_prompt = config.prompt
+        api_key = ""
+        metadata_signature = ""
+        target: Optional[ImageResult] = None
+        try:
+            api_key = prepare_run(config)
+            metadata_signature = metadata_signature_for_config(config)
+            with state_lock:
+                for result in app_state["results"]:
+                    if int(result.index) == target_index:
+                        target = result
+                        break
+                if target is None:
+                    raise ValueError("找不到要修正重辨的照片。")
+                remove_completed_source_for_result(app_state["completed_sources"], target)
+
+            image_path = Path(target.source_path)
+            if not image_path.exists():
+                raise FileNotFoundError(f"找不到原始照片：{target.source_path}")
+            if not is_within_file_limit(image_path, config.max_file_mb):
+                raise ValueError(file_limit_error(image_path, config.max_file_mb))
+
+            placeholder = ImageResult(
+                index=target.index,
+                filename=target.filename,
+                source_path=target.source_path,
+                status="processing",
+                provider=config.provider,
+                model=config.model,
+                title=target.title,
+                description=target.description,
+                zh_summary="正在依修正資訊重新辨識。",
+                keywords=list(target.keywords or []),
+                keyword_groups=[dict(group) for group in (target.keyword_groups or [])],
+                categories=list(target.categories or []),
+                notes=f"修正資訊：{correction[:200]}",
+                copy_line=target.copy_line,
+                prompt_signature=metadata_signature,
+            )
+            replace_result_by_index(target_index, placeholder)
+
+            corrected_prompt = prompt_with_user_correction(base_prompt, image_path.name, correction)
+            config.prompt = corrected_prompt
+            total = int(app_state.get("total") or len(app_state.get("results") or []))
+            set_state(state="修正重辨中", mode="reanalyze")
+            add_log(f"[修正重辨] {image_path.name}：{correction}")
+
+            raw_metadata: Optional[dict[str, Any]] = None
+            last_error: Optional[Exception] = None
+            for attempt in range(config.retry_count + 1):
+                if stop_event.is_set():
+                    raise RuntimeError("修正重辨已停止。")
+                try:
+                    ensure_daily_limit(config, 1)
+                    record_api_attempt(config)
+                    set_current(
+                        current_progress_payload(
+                            "修正重辨中" if attempt == 0 else "修正重辨重新送出",
+                            image_path.name,
+                            target_index,
+                            total,
+                            attempt=attempt + 1,
+                            max_attempts=config.retry_count + 1,
+                        )
+                    )
+                    raw_metadata = analyze_one_image(
+                        config,
+                        image_path,
+                        api_key,
+                        strict_json_retry=isinstance(last_error, ModelOutputFormatError),
+                    )
+                    break
+                except UsageLimitError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < config.retry_count:
+                        wait_seconds = retry_wait_seconds(exc, attempt)
+                        retry_until = time.time() + wait_seconds
+                        set_current(
+                            current_progress_payload(
+                                "修正重辨等待重試",
+                                image_path.name,
+                                target_index,
+                                total,
+                                attempt=attempt + 1,
+                                max_attempts=config.retry_count + 1,
+                                retry_until=retry_until,
+                            )
+                        )
+                        add_log(
+                            f"[修正重辨] 重試 {attempt + 1}/{config.retry_count}："
+                            f"{redact_sensitive(exc, [api_key, config.api_key])}，等待 {wait_seconds} 秒"
+                        )
+                        wait_for_retry(wait_seconds, stop_event)
+
+            if raw_metadata is None:
+                raise last_error or RuntimeError("修正重辨失敗。")
+
+            normalized = normalize_metadata(raw_metadata)
+            corrected = ImageResult(
+                index=target.index,
+                filename=target.filename,
+                source_path=target.source_path,
+                status="ok",
+                provider=config.provider,
+                model=config.model,
+                title=normalized["title"],
+                description=normalized["description"],
+                zh_summary=normalized["zh_summary"],
+                keywords=normalized["keywords"],
+                keyword_groups=normalized["keyword_groups"],
+                categories=normalized["categories"],
+                notes=normalized["notes"],
+                copy_line=normalized["copy_line"],
+                prompt_signature=metadata_signature,
+            )
+            replace_result_by_index(target_index, corrected)
+            with state_lock:
+                source_token = completed_source_token_for_result(corrected)
+                if source_token:
+                    app_state["completed_sources"].add(source_token)
+                results_copy = list(app_state["results"])
+                completed_sources = set(app_state["completed_sources"])
+            save_pending_results(results_copy, completed_sources)
+            set_current(current_progress_payload("修正重辨完成", image_path.name, target_index, total))
+            set_state(state="完成")
+            add_log(f"[修正重辨] 完成：{image_path.name}")
+        except Exception as exc:
+            message = redact_sensitive(exc, [api_key, config.api_key])
+            if target is not None:
+                failed = ImageResult(
+                    index=target.index,
+                    filename=target.filename,
+                    source_path=target.source_path,
+                    status="error",
+                    provider=config.provider,
+                    model=config.model,
+                    zh_summary="修正重辨失敗，請查看錯誤原因後再試一次。",
+                    notes=f"修正資訊：{correction[:200]}",
+                    error=message,
+                    prompt_signature=metadata_signature,
+                )
+                replace_result_by_index(target_index, failed)
+            set_current(current_progress_payload("修正重辨失敗"))
+            set_state(state="修正失敗")
+            add_log(f"[修正重辨] 錯誤：{message}")
+        finally:
+            config.prompt = base_prompt
+            set_state(running=False)
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -3564,6 +3787,52 @@ def run_web_gui(port: int = 8765) -> None:
                     worker.start()
                     self.send_json({"ok": True})
                     return
+                if parsed.path == "/api/reanalyze-result":
+                    with state_lock:
+                        if app_state["running"]:
+                            self.send_json({"error": "請先按「停止」或等目前工作完成，再修正重辨單張照片。"}, 409)
+                            return
+                    payload = self.read_json()
+                    target_index = int(payload.get("index", 0) or 0)
+                    correction = str(payload.get("correction", "")).strip()
+                    if target_index <= 0:
+                        self.send_json({"error": "找不到要修正重辨的照片。"}, 400)
+                        return
+                    if not correction:
+                        self.send_json({"error": "請輸入正確資訊，例如：這張是鹹蛋苦瓜，不是炒高麗菜。"}, 400)
+                        return
+                    config, _watch_mode = config_from_payload(payload)
+                    save_settings(
+                        {
+                            "folder": str(config.folder),
+                            "provider": config.provider,
+                            "model": config.model,
+                            "watch": False,
+                            "prompt": config.prompt,
+                            "prompt_name": str(payload.get("prompt_name", "default")).strip() or "default",
+                        }
+                    )
+                    stop_event = threading.Event()
+                    with state_lock:
+                        app_state.update(
+                            {
+                                "state": "準備修正重辨",
+                                "current": current_progress_payload("準備修正重辨", index=target_index, total=int(app_state["total"] or 0)),
+                                "mode": "reanalyze",
+                                "running": True,
+                                "stop_event": stop_event,
+                            }
+                        )
+                    worker = threading.Thread(
+                        target=run_reanalyze_job,
+                        args=(config, target_index, correction, stop_event),
+                        daemon=True,
+                    )
+                    with state_lock:
+                        app_state["worker"] = worker
+                    worker.start()
+                    self.send_json({"ok": True})
+                    return
                 if parsed.path == "/api/save-prompt":
                     payload = self.read_json()
                     name = str(payload.get("name", "default")).strip() or "default"
@@ -3620,10 +3889,15 @@ def run_web_gui(port: int = 8765) -> None:
                     target_index = int(payload.get("index", 0) or 0)
                     with state_lock:
                         current_results = list(app_state["results"])
+                        removed_results = [
+                            result for result in current_results if int(result.index) == target_index
+                        ]
                         remaining = [result for result in current_results if int(result.index) != target_index]
                         if len(remaining) == len(current_results):
                             self.send_json({"error": "找不到要刪除的結果。"}, 404)
                             return
+                        for removed in removed_results:
+                            remove_completed_source_for_result(app_state["completed_sources"], removed)
                         app_state["results"] = reindex_results(remaining)
                         if not app_state["running"]:
                             app_state["done"] = len(app_state["results"])
