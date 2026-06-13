@@ -2665,21 +2665,52 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       font-size: 15px;
     }}
     progress {{ width: 100%; height: 14px; margin-top: 8px; }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-    }}
-    th, td {{
+    .result-header {{
+      display: grid;
+      grid-template-columns: 170px minmax(280px, 1fr) minmax(360px, 1.25fr) minmax(200px, 0.65fr) minmax(260px, 0.75fr);
+      gap: 12px;
+      min-width: 1180px;
+      padding: 9px 12px;
       border-bottom: 1px solid var(--line);
-      padding: 8px;
-      text-align: left;
-      vertical-align: top;
+      background: #eef2f7;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    .result-list {{
+      display: grid;
+      gap: 10px;
+      min-width: 1180px;
+      padding: 10px;
+    }}
+    .result-card {{
+      display: grid;
+      grid-template-columns: 170px minmax(280px, 1fr) minmax(360px, 1.25fr) minmax(200px, 0.65fr) minmax(260px, 0.75fr);
+      gap: 12px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }}
+    .result-card.error-card {{ background: #fffafa; border-color: #f5c2bd; }}
+    .result-section {{
+      min-width: 0;
+      line-height: 1.45;
       font-size: 13px;
     }}
-    th {{ background: #eef2f7; position: sticky; top: 0; }}
-    .photo-cell {{ min-width: 170px; max-width: 190px; }}
+    .section-label {{
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }}
+    .photo-cell {{ min-width: 0; }}
     .row-thumb {{
       width: 150px;
       height: 104px;
@@ -2691,6 +2722,19 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       margin-bottom: 7px;
     }}
     .filename {{ font-weight: 650; word-break: break-word; }}
+    .photo-cell > .ok,
+    .photo-cell > .processing,
+    .photo-cell > .pending,
+    .photo-cell > .superseded,
+    .photo-cell > .error {{
+      display: inline-block;
+      margin-top: 6px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #f8fafc;
+      border: 1px solid currentColor;
+      font-size: 12px;
+    }}
     .photo-actions {{
       display: flex;
       flex-wrap: wrap;
@@ -2704,14 +2748,22 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       line-height: 1.2;
     }}
     .zh-summary {{
-      min-width: 180px;
-      max-width: 260px;
       line-height: 1.45;
       color: #344054;
+      margin-top: 8px;
     }}
     .title {{ font-weight: 650; margin-bottom: 6px; }}
     .description, .keywords, .notes {{ line-height: 1.45; }}
-    .keywords {{ min-width: 260px; max-width: 360px; }}
+    .title-description {{
+      max-height: 220px;
+      overflow: auto;
+      padding-right: 4px;
+    }}
+    .keywords {{
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 6px;
+    }}
     .keyword-group {{
       margin-bottom: 10px;
       padding-bottom: 8px;
@@ -2719,10 +2771,14 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
     .keyword-group:last-child {{ border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }}
     .keyword-group-name {{ font-weight: 700; color: #344054; margin-bottom: 4px; }}
-    .notes {{ max-width: 260px; }}
+    .notes {{
+      max-height: 220px;
+      overflow: auto;
+      color: #344054;
+      padding-right: 4px;
+    }}
     .actions {{
-      min-width: 280px;
-      max-width: 360px;
+      min-width: 0;
     }}
     .copy-panel {{
       display: grid;
@@ -2813,6 +2869,13 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       .logpanel .logwrap {{ max-height: 240px; }}
       .actions {{ min-width: 0; max-width: none; }}
       .copy-group {{ grid-template-columns: 1fr 1fr; }}
+      .result-header {{ display: none; }}
+      .result-list {{ min-width: 0; padding: 8px; }}
+      .result-card {{
+        grid-template-columns: 1fr;
+        min-width: 0;
+      }}
+      .keywords, .notes, .title-description {{ max-height: none; }}
     }}
   </style>
 </head>
@@ -2922,10 +2985,14 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         </div>
       </div>
       <div class="tablewrap">
-        <table>
-          <thead><tr><th>照片 / 檔名</th><th>狀態</th><th>中文說明</th><th>Title / Description</th><th>Keywords</th><th>Notes</th><th>複製</th></tr></thead>
-          <tbody id="results"></tbody>
-        </table>
+        <div class="result-header">
+          <div>照片 / 狀態</div>
+          <div>Title / Description</div>
+          <div>Keywords</div>
+          <div>Notes</div>
+          <div>複製</div>
+        </div>
+        <div id="results" class="result-list"></div>
       </div>
       <details id="logPanel" class="logpanel">
         <summary><span>監測紀錄</span><span id="logSummary" class="hint">0 筆</span></summary>
@@ -3472,25 +3539,35 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       copySeq = 0;
       results.innerHTML = (items || []).map(item => {{
         return `
-          <tr>
-            <td class="photo-cell">
+          <article class="result-card ${{item.status === 'error' ? 'error-card' : ''}}">
+            <div class="result-section photo-cell">
               <img class="row-thumb" src="${{esc(thumbnailSrc(item))}}" alt="" loading="lazy">
               <div class="filename">${{esc(item.filename)}}</div>
               <div class="hint">#${{esc(item.index || '')}}</div>
+              <div class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</div>
+              <div class="zh-summary">${{esc(zhSummary(item))}}</div>
               ${{renderPhotoActions(item)}}
-            </td>
-            <td class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</td>
-            <td class="zh-summary">${{esc(zhSummary(item))}}</td>
-            <td>
-              <div class="title">${{esc(item.title)}}</div>
-              <div class="description">${{esc(item.description)}}</div>
-            </td>
-            <td class="keywords">${{renderKeywordGroups(item)}}</td>
-            <td class="notes">${{esc(item.notes || item.error || '')}}</td>
-            <td class="actions">
+            </div>
+            <div class="result-section">
+              <div class="section-label">Title / Description</div>
+              <div class="title-description">
+                <div class="title">${{esc(item.title)}}</div>
+                <div class="description">${{esc(item.description)}}</div>
+              </div>
+            </div>
+            <div class="result-section">
+              <div class="section-label">Keywords</div>
+              <div class="keywords">${{renderKeywordGroups(item)}}</div>
+            </div>
+            <div class="result-section">
+              <div class="section-label">Notes</div>
+              <div class="notes">${{esc(item.notes || item.error || '')}}</div>
+            </div>
+            <div class="result-section actions">
+              <div class="section-label">複製</div>
               ${{renderCopyButtons(item)}}
-            </td>
-          </tr>
+            </div>
+          </article>
         `;
       }}).join('');
     }}
