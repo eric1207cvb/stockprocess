@@ -770,6 +770,51 @@ def extract_gemini_text(response: dict[str, Any]) -> str:
     raise ValueError("Gemini 回應中找不到文字輸出。")
 
 
+def compact_model_excerpt(text: str, limit: int = 260) -> str:
+    compact = re.sub(r"\s+", " ", str(text).strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip() + "..."
+
+
+def detect_plain_keyword_list(text: str) -> list[str]:
+    raw = str(text).strip()
+    if not raw or "{" in raw or "}" in raw:
+        return []
+    items = [
+        item.strip(" \t\r\n\"'`")
+        for item in re.split(r"[,;，、\n]+", raw)
+        if item.strip(" \t\r\n\"'`")
+    ]
+    if len(items) < 8:
+        return []
+    short_items = [item for item in items[:30] if 1 <= len(item) <= 60]
+    return items if len(short_items) >= min(len(items), 12) else []
+
+
+def keyword_list_format_error(text: str, count: Optional[int] = None) -> str:
+    detected_count = count if count is not None else len(detect_plain_keyword_list(text))
+    count_text = f"偵測到 {detected_count} 個疑似 keywords。" if detected_count else ""
+    return (
+        "模型只回傳了關鍵字清單，缺少程式需要的 JSON 欄位。"
+        "原因通常是 Prompt 要求只輸出 keywords，或模型忽略 JSON 格式。"
+        "請在 Prompt 加上「請只輸出 JSON object，包含 title、description、zh_summary、"
+        "keywords、keyword_groups、categories、notes、copy_line」，再按「繼續未完成」"
+        "或用「修正重辨」。"
+        f"{count_text}原始回應開頭：{compact_model_excerpt(text)}"
+    )
+
+
+def model_json_format_error(text: str, message: str) -> str:
+    if detect_plain_keyword_list(text):
+        return keyword_list_format_error(text)
+    return (
+        f"{message} 程式需要完整 JSON object 才能分欄顯示與產生複製按鈕。"
+        "請確認 Prompt 沒有要求只輸出純文字或只輸出 keywords。"
+        f"原始回應開頭：{compact_model_excerpt(text)}"
+    )
+
+
 def call_openai(
     image_path: Path,
     prompt: str,
@@ -867,20 +912,29 @@ def parse_model_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError as first_error:
         start = raw.find("{")
         if start == -1:
-            raise ModelOutputFormatError(f"模型回應不是 JSON：{raw[:300]}") from first_error
+            raise ModelOutputFormatError(
+                model_json_format_error(raw, "模型回應不是 JSON。")
+            ) from first_error
         try:
             parsed, _ = decoder.raw_decode(raw[start:])
         except json.JSONDecodeError as exc:
             raise ModelOutputFormatError(
-                f"模型回應不是完整有效 JSON：{raw[:300]}"
+                model_json_format_error(raw, "模型回應不是完整有效 JSON。")
             ) from exc
 
     if isinstance(parsed, list):
         if not parsed:
             raise ModelOutputFormatError("模型回應 JSON list 為空。")
+        if all(isinstance(item, str) for item in parsed):
+            raise ModelOutputFormatError(
+                keyword_list_format_error(", ".join(parsed), count=len(parsed))
+            )
         parsed = parsed[0]
     if not isinstance(parsed, dict):
-        raise ModelOutputFormatError("模型回應 JSON 不是 object。")
+        raise ModelOutputFormatError(
+            "模型回應 JSON 不是 object。程式需要包含 title、description、zh_summary、"
+            "keywords、keyword_groups、categories、notes、copy_line 的 JSON object。"
+        )
     return parsed
 
 
@@ -3045,6 +3099,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const message = String(item.notes || item.error || '');
       if (/503|high demand|滿載|UNAVAILABLE/i.test(message)) {{
         return '模型目前滿載，這張尚未完成；稍後按「繼續未完成」即可重新嘗試。';
+      }}
+      if (/只回傳了關鍵字清單|缺少程式需要的 JSON|不是完整有效 JSON|JSON 不是 object/i.test(message)) {{
+        return '模型輸出格式不符合：它只回傳關鍵字或不是完整 JSON。請調整 Prompt 後續跑，或按「修正重辨」。';
       }}
       if (item.status !== 'ok') return '這張尚未完成，請查看錯誤原因後稍後續跑。';
       return item.title ? '照片內容請參考英文標題：' + item.title : '尚未產生中文說明。';
