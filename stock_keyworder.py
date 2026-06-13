@@ -1636,6 +1636,75 @@ def save_settings(settings: dict[str, Any]) -> None:
         pass
 
 
+def choose_folder_dialog() -> str:
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        script = 'POSIX path of (choose folder with prompt "選擇照片資料夾")'
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except Exception:
+            pass
+
+    if sys.platform.startswith("win"):
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if powershell:
+            command = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$dialog.Description = '選擇照片資料夾'; "
+                "$dialog.ShowNewFolderButton = $false; "
+                "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+                "{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                "Write-Output $dialog.SelectedPath }"
+            )
+            try:
+                result = subprocess.run(
+                    [powershell, "-STA", "-NoProfile", "-Command", command],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+                return result.stdout.strip() if result.returncode == 0 else ""
+            except Exception:
+                pass
+
+    if shutil.which("zenity"):
+        try:
+            result = subprocess.run(
+                ["zenity", "--file-selection", "--directory", "--title=選擇照片資料夾"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(title="選擇照片資料夾")
+        root.destroy()
+        return selected or ""
+    except Exception:
+        return ""
+
+
 def safe_prompt_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", name.strip())
     cleaned = cleaned.strip("._-")
@@ -2109,8 +2178,11 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       <section>
         <h2>1 照片來源</h2>
         <label>照片資料夾完整路徑</label>
-        <input name="folder" value="{folder}" placeholder="/Users/你的帳號/Desktop/photos">
-        <div class="hint">瀏覽器安全限制無法直接取得資料夾路徑，請從 Finder 複製路徑貼上。</div>
+        <div class="grid2">
+          <input name="folder" value="{folder}" placeholder="/Users/你的帳號/Desktop/photos">
+          <button type="button" id="chooseFolderBtn">選擇資料夾</button>
+        </div>
+        <div class="hint">不知道路徑時請按「選擇資料夾」；也可手動貼上完整路徑。</div>
       </section>
 
       <section>
@@ -2241,6 +2313,24 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const knownProviders = Object.keys(providerDefaults);
     let lastStatus = null;
     let serverOffsetSeconds = 0;
+
+    document.getElementById('chooseFolderBtn').onclick = async () => {{
+      const button = document.getElementById('chooseFolderBtn');
+      const oldText = button.textContent;
+      button.disabled = true;
+      button.textContent = '選擇中...';
+      try {{
+        const data = await postJson('/api/select-folder', {{}});
+        if (data.folder) {{
+          form.folder.value = data.folder;
+        }}
+      }} catch (error) {{
+        alert(error.message);
+      }} finally {{
+        button.disabled = false;
+        button.textContent = oldText;
+      }}
+    }};
 
     document.getElementById('defaultPrompt').onclick = () => form.prompt.value = defaultPrompt;
     document.getElementById('savePromptBtn').onclick = async () => {{
@@ -2836,6 +2926,10 @@ def run_web_gui(port: int = 8765) -> None:
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             try:
+                if parsed.path == "/api/select-folder":
+                    folder_path = choose_folder_dialog()
+                    self.send_json({"ok": True, "folder": folder_path, "cancelled": not bool(folder_path)})
+                    return
                 if parsed.path == "/api/start":
                     with state_lock:
                         if app_state["running"]:
