@@ -72,10 +72,12 @@ PROMPT_DIR = Path.home() / ".stock_keyworder_prompts"
 KEY_CACHE_PATH = Path.home() / ".stock_keyworder_keys.json"
 KEYCHAIN_SERVICE = "Stock Keyworder"
 PENDING_PATH = Path.home() / ".stock_keyworder_pending.json"
-DEFAULT_DAILY_API_LIMIT = 500
+DEFAULT_API_RETRY_BUFFER = 100
+DEFAULT_DAILY_API_LIMIT = MAX_IMAGES + DEFAULT_API_RETRY_BUFFER
 MAX_DAILY_API_LIMIT = 10000
 CONFIRM_API_CALLS_THRESHOLD = 25
 MAX_RETRY_COUNT = 3
+DEFAULT_RETRY_COUNT = 2
 DEFAULT_MAX_FILE_MB = 64
 MAX_FILE_MB = 512
 MODEL_MAX_OUTPUT_TOKENS = 3000
@@ -119,7 +121,7 @@ class RunConfig:
     max_side: int = 1600
     max_file_mb: int = DEFAULT_MAX_FILE_MB
     timeout_seconds: int = 180
-    retry_count: int = 1
+    retry_count: int = DEFAULT_RETRY_COUNT
     daily_limit: int = DEFAULT_DAILY_API_LIMIT
     usage_start_count: int = 0
     api_attempts_this_run: int = 0
@@ -1041,12 +1043,65 @@ def reindex_results(results: list[ImageResult]) -> list[ImageResult]:
     return limited
 
 
-def save_pending_results(results: list[ImageResult]) -> dict[str, Any]:
+def source_key_for_path(path: Path) -> str:
+    try:
+        return str(path.expanduser().resolve())
+    except Exception:
+        return str(path.expanduser())
+
+
+def source_key_for_result(result: ImageResult) -> str:
+    if result.source_path:
+        return source_key_for_path(Path(result.source_path))
+    return result.filename.strip().casefold()
+
+
+def is_completed_result(result: ImageResult) -> bool:
+    if result.status == "ok":
+        return True
+    return result.error.startswith("單檔大小")
+
+
+def completed_sources_from_results(results: list[ImageResult]) -> set[str]:
+    return {
+        source_key_for_result(result)
+        for result in results
+        if is_completed_result(result) and source_key_for_result(result)
+    }
+
+
+def discover_remaining_images(
+    config: RunConfig,
+    results: list[ImageResult],
+    completed_sources: Optional[set[str]] = None,
+) -> list[Path]:
+    images = discover_images(config.folder, config.max_images)
+    skip_sources = set(completed_sources or set())
+    skip_sources.update(completed_sources_from_results(results))
+    skip_filenames = {
+        result.filename.strip().casefold()
+        for result in results
+        if is_completed_result(result) and result.filename.strip()
+    }
+    return [
+        path
+        for path in images
+        if source_key_for_path(path) not in skip_sources and path.name.casefold() not in skip_filenames
+    ]
+
+
+def save_pending_results(
+    results: list[ImageResult],
+    completed_sources: Optional[set[str]] = None,
+) -> dict[str, Any]:
     limited = reindex_results(list(results))
+    saved_completed_sources = set(completed_sources or set())
+    saved_completed_sources.update(completed_sources_from_results(limited))
     payload = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
         "max_results": MAX_IMAGES,
         "count": len(limited),
+        "completed_sources": sorted(saved_completed_sources)[:MAX_IMAGES],
         "results": [asdict(result) for result in limited],
     }
     PENDING_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1062,19 +1117,32 @@ def save_pending_results(results: list[ImageResult]) -> dict[str, Any]:
     }
 
 
-def load_pending_results() -> list[ImageResult]:
+def load_pending_state() -> tuple[list[ImageResult], set[str]]:
     if not PENDING_PATH.exists():
-        return []
+        return [], set()
     payload = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
     raw_results = payload.get("results", [])
     if not isinstance(raw_results, list):
-        return []
+        raw_results = []
     results = [
         result_from_dict(item, index)
         for index, item in enumerate(raw_results[:MAX_IMAGES], start=1)
         if isinstance(item, dict)
     ]
-    return reindex_results(results)
+    completed_sources_raw = payload.get("completed_sources", [])
+    completed_sources_items = (
+        completed_sources_raw[:MAX_IMAGES]
+        if isinstance(completed_sources_raw, list)
+        else []
+    )
+    completed_sources = {str(item) for item in completed_sources_items if str(item).strip()}
+    completed_sources.update(completed_sources_from_results(results))
+    return reindex_results(results), completed_sources
+
+
+def load_pending_results() -> list[ImageResult]:
+    results, _ = load_pending_state()
+    return results
 
 
 def pending_results_status() -> dict[str, Any]:
@@ -1779,6 +1847,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       <section>
         <h2>4 執行</h2>
         <label><input name="watch" type="checkbox" style="width:auto" {watch_checked}> 監看資料夾</label>
+        <div class="hint">預設最多處理 500 張照片；會保留 100 次 API 重試緩衝，仍有每日硬上限。</div>
         <div class="controls">
           <button class="primary" type="submit" id="startBtn">開始</button>
           <button class="danger" type="button" id="stopBtn">停止</button>
@@ -1797,6 +1866,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           <div class="statusactions">
             <button type="button" id="saveProgressBtn">儲存進度</button>
             <button type="button" id="loadProgressBtn">載入進度</button>
+            <button type="button" id="resumeProgressBtn">繼續未完成</button>
           </div>
         </div>
         <progress id="progress" value="0" max="1"></progress>
@@ -1826,7 +1896,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       max_images: {MAX_IMAGES},
       max_side: 1600,
       max_file_mb: {DEFAULT_MAX_FILE_MB},
-      daily_limit: {DEFAULT_DAILY_API_LIMIT}
+      daily_limit: {DEFAULT_DAILY_API_LIMIT},
+      retry_count: {DEFAULT_RETRY_COUNT}
     }};
     const providerDefaults = {json.dumps(PROVIDER_DEFAULT_MODELS, ensure_ascii=False)};
     const providerModels = {json.dumps(PROVIDER_MODEL_SUGGESTIONS, ensure_ascii=False)};
@@ -1882,6 +1953,13 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         await refresh();
         await refreshPendingStatus();
         alert('已載入 ' + data.count + ' 筆進度');
+      }} catch (error) {{
+        alert(error.message);
+      }}
+    }};
+    document.getElementById('resumeProgressBtn').onclick = async () => {{
+      try {{
+        await postJson('/api/resume', formPayload());
       }} catch (error) {{
         alert(error.message);
       }}
@@ -2044,6 +2122,7 @@ def run_web_gui(port: int = 8765) -> None:
         "total": 0,
         "logs": [],
         "results": [],
+        "completed_sources": set(),
         "manifest": {},
         "running": False,
         "stop_event": None,
@@ -2097,6 +2176,7 @@ def run_web_gui(port: int = 8765) -> None:
                 max_images=int(payload.get("max_images", MAX_IMAGES)),
                 max_side=int(payload.get("max_side", 1600)),
                 max_file_mb=int(payload.get("max_file_mb", DEFAULT_MAX_FILE_MB)),
+                retry_count=int(payload.get("retry_count", DEFAULT_RETRY_COUNT)),
                 daily_limit=int(payload.get("daily_limit", DEFAULT_DAILY_API_LIMIT)),
             ),
             bool(payload.get("watch", False)),
@@ -2114,6 +2194,10 @@ def run_web_gui(port: int = 8765) -> None:
             elif kind == "result":
                 with state_lock:
                     app_state["results"].append(payload)
+                    if is_completed_result(payload):
+                        source_key = source_key_for_result(payload)
+                        if source_key:
+                            app_state["completed_sources"].add(source_key)
             elif kind in {"done", "saved"}:
                 set_state(manifest=payload, state="完成")
                 if payload.get("html"):
@@ -2127,6 +2211,64 @@ def run_web_gui(port: int = 8765) -> None:
             else:
                 manifest = process_folder(config, progress=progress, stop_event=stop_event)
             set_state(manifest=manifest, state="完成")
+        except Exception as exc:
+            set_state(state="錯誤")
+            add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
+        finally:
+            set_state(running=False)
+
+    def run_resume_job(config: RunConfig, stop_event: threading.Event) -> None:
+        def progress(kind: str, payload: Any) -> None:
+            if kind == "log":
+                add_log(redact_sensitive(payload, [config.api_key]))
+            elif kind == "progress":
+                set_state(done=int(payload["done"]), total=int(payload["total"]))
+            elif kind == "result":
+                with state_lock:
+                    app_state["results"].append(payload)
+                    if is_completed_result(payload):
+                        source_key = source_key_for_result(payload)
+                        if source_key:
+                            app_state["completed_sources"].add(source_key)
+
+        try:
+            api_key = prepare_run(config)
+            with state_lock:
+                all_existing_results = reindex_results(list(app_state["results"]))
+                existing_results = reindex_results(
+                    [result for result in all_existing_results if is_completed_result(result)]
+                )
+                retryable_error_count = len(all_existing_results) - len(existing_results)
+                completed_sources = set(app_state["completed_sources"])
+                app_state["results"] = existing_results
+                app_state["completed_sources"] = completed_sources | completed_sources_from_results(existing_results)
+
+            remaining_images = discover_remaining_images(config, existing_results, completed_sources)
+            total_count = len(existing_results) + len(remaining_images)
+            ensure_daily_limit(config, count_api_eligible_images(remaining_images, config.max_file_mb))
+            set_state(total=total_count, done=len(existing_results), state="執行中")
+            if retryable_error_count:
+                add_log(f"續跑：移除 {retryable_error_count} 筆可重試錯誤，會重新分析。")
+            add_log(f"續跑：已保留 {len(existing_results)} 筆完成資料，剩餘 {len(remaining_images)} 張未完成照片。")
+
+            if remaining_images:
+                analyze_images(
+                    config,
+                    remaining_images,
+                    api_key,
+                    progress=progress,
+                    stop_event=stop_event,
+                    start_index=len(existing_results) + 1,
+                    completed_before=len(existing_results),
+                    total_count=total_count,
+                )
+
+            with state_lock:
+                final_results = reindex_results(list(app_state["results"]))
+                app_state["results"] = final_results
+            manifest = build_result_manifest(final_results, config)
+            set_state(manifest=manifest, state="完成")
+            add_log("續跑完成，結果已顯示在右側表格。")
         except Exception as exc:
             set_state(state="錯誤")
             add_log(f"錯誤：{redact_sensitive(exc, [config.api_key])}")
@@ -2206,6 +2348,7 @@ def run_web_gui(port: int = 8765) -> None:
                                 "total": 0,
                                 "logs": [],
                                 "results": [],
+                                "completed_sources": set(),
                                 "manifest": {},
                                 "running": True,
                                 "stop_event": stop_event,
@@ -2214,6 +2357,61 @@ def run_web_gui(port: int = 8765) -> None:
                     worker = threading.Thread(
                         target=run_job,
                         args=(config, watch_mode, stop_event),
+                        daemon=True,
+                    )
+                    with state_lock:
+                        app_state["worker"] = worker
+                    worker.start()
+                    self.send_json({"ok": True})
+                    return
+                if parsed.path == "/api/resume":
+                    with state_lock:
+                        if app_state["running"]:
+                            self.send_json({"error": "已有工作正在執行。"}, 409)
+                            return
+                    payload = self.read_json()
+                    config, watch_mode = config_from_payload(payload)
+                    if watch_mode:
+                        self.send_json({"error": "續跑請先取消監看資料夾。"}, 400)
+                        return
+                    with state_lock:
+                        current_results = list(app_state["results"])
+                    completed_sources: set[str] = set()
+                    if not current_results and pending_results_status().get("exists"):
+                        current_results, completed_sources = load_pending_state()
+                    elif current_results:
+                        with state_lock:
+                            completed_sources = set(app_state["completed_sources"])
+                    if not current_results and not completed_sources:
+                        self.send_json({"error": "目前沒有可續跑進度，請先按開始。"}, 400)
+                        return
+                    save_settings(
+                        {
+                            "folder": str(config.folder),
+                            "provider": config.provider,
+                            "model": config.model,
+                            "watch": False,
+                            "prompt": config.prompt,
+                            "prompt_name": str(payload.get("prompt_name", "default")).strip() or "default",
+                        }
+                    )
+                    stop_event = threading.Event()
+                    with state_lock:
+                        app_state.update(
+                            {
+                                "state": "準備續跑",
+                                "done": len(current_results),
+                                "total": len(current_results),
+                                "results": reindex_results(current_results),
+                                "completed_sources": completed_sources | completed_sources_from_results(current_results),
+                                "manifest": {},
+                                "running": True,
+                                "stop_event": stop_event,
+                            }
+                        )
+                    worker = threading.Thread(
+                        target=run_resume_job,
+                        args=(config, stop_event),
                         daemon=True,
                     )
                     with state_lock:
@@ -2248,7 +2446,8 @@ def run_web_gui(port: int = 8765) -> None:
                 if parsed.path == "/api/save-progress":
                     with state_lock:
                         results_copy = list(app_state["results"])
-                    self.send_json(save_pending_results(results_copy))
+                        completed_sources = set(app_state["completed_sources"])
+                    self.send_json(save_pending_results(results_copy, completed_sources))
                     return
                 if parsed.path == "/api/load-progress":
                     if not pending_results_status().get("exists"):
@@ -2258,11 +2457,12 @@ def run_web_gui(port: int = 8765) -> None:
                         if app_state["running"]:
                             self.send_json({"error": "執行中不能載入進度，請先停止或等完成。"}, 409)
                             return
-                    pending_results = load_pending_results()
+                    pending_results, completed_sources = load_pending_state()
                     with state_lock:
                         app_state["results"] = pending_results
                         app_state["done"] = len(pending_results)
                         app_state["total"] = len(pending_results)
+                        app_state["completed_sources"] = completed_sources
                         app_state["state"] = "已載入進度"
                         app_state["manifest"] = {}
                     add_log(f"已載入 {len(pending_results)} 筆進度。")
@@ -2282,7 +2482,8 @@ def run_web_gui(port: int = 8765) -> None:
                             app_state["done"] = len(app_state["results"])
                             app_state["total"] = len(app_state["results"])
                         results_copy = list(app_state["results"])
-                    saved = save_pending_results(results_copy)
+                        completed_sources = set(app_state["completed_sources"])
+                    saved = save_pending_results(results_copy, completed_sources)
                     add_log(f"已刪除第 {target_index} 筆，剩餘 {len(results_copy)} 筆；進度已更新。")
                     self.send_json({"ok": True, "count": len(results_copy), "saved": saved})
                     return
@@ -3221,7 +3422,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-side", type=int, default=1600)
     parser.add_argument("--max-file-mb", type=int, default=DEFAULT_MAX_FILE_MB)
     parser.add_argument("--timeout", type=int, default=180)
-    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRY_COUNT)
     parser.add_argument("--daily-limit", type=int, default=DEFAULT_DAILY_API_LIMIT)
     parser.add_argument("--yes", action="store_true", help="跳過大量 API 使用確認。")
     parser.add_argument("--watch", action="store_true", help="監看資料夾，新照片穩定後自動分析。")
