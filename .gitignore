@@ -1,0 +1,14 @@
+.venv/
+.pycache/
+__pycache__/
+*.py[cod]
+stock_keyworder.log
+.DS_Store
+
+# Local user state; do not commit API keys, settings, or unfinished work queues.
+.stock_keyworder_config.json
+.stock_keyworder_keys.json
+.stock_keyworder_pending.json
+.stock_keyworder_usage.json
+.stock_keyworder_prompts/
+
