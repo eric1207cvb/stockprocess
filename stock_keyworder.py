@@ -1332,7 +1332,15 @@ def watch_folder(
     last_manifest: dict[str, Any] = build_result_manifest(results, config, output_dir)
 
     if progress:
-        progress("scan", {"total": config.max_images, "output_dir": str(output_dir or ""), "mode": "watch"})
+        progress(
+            "scan",
+            {
+                "total": 0,
+                "capacity": config.max_images,
+                "output_dir": str(output_dir or ""),
+                "mode": "watch",
+            },
+        )
         progress("log", f"開始監看：{config.folder}")
 
     while not (stop_event and stop_event.is_set()):
@@ -1356,6 +1364,15 @@ def watch_folder(
         ]
         if candidates:
             if progress:
+                progress(
+                    "scan",
+                    {
+                        "total": len(all_images),
+                        "capacity": config.max_images,
+                        "output_dir": str(output_dir or ""),
+                        "mode": "watch",
+                    },
+                )
                 progress("log", f"偵測到 {len(candidates)} 張新照片。")
             new_results = analyze_images(
                 config,
@@ -1365,7 +1382,7 @@ def watch_folder(
                 stop_event=stop_event,
                 start_index=len(results) + 1,
                 completed_before=len(results),
-                total_count=config.max_images,
+                total_count=len(all_images),
                 reuse_candidates=results,
             )
             results.extend(new_results)
@@ -1385,7 +1402,7 @@ def watch_folder(
             break
 
         if progress:
-            progress("watch_idle", {"count": len(results)})
+            progress("watch_idle", {"count": len(results), "total": len(all_images), "capacity": config.max_images})
 
         time.sleep(interval_seconds)
 
@@ -2728,6 +2745,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
             <button type="button" id="saveProgressBtn">儲存進度</button>
             <button type="button" id="loadProgressBtn">載入進度</button>
             <button type="button" id="resumeProgressBtn">繼續未完成</button>
+            <button type="button" id="newBatchBtn">新一批</button>
           </div>
         </div>
         <progress id="progress" value="0" max="1"></progress>
@@ -2874,6 +2892,17 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     document.getElementById('resumeProgressBtn').onclick = async () => {{
       try {{
         await postJson('/api/resume', formPayload());
+      }} catch (error) {{
+        alert(error.message);
+      }}
+    }};
+    document.getElementById('newBatchBtn').onclick = async () => {{
+      try {{
+        if (!confirm('新一批會清空目前畫面與進度狀態，但不會刪除原始照片。請先更換或清空照片資料夾後再開始下一批。確定初始化？')) return;
+        const data = await postJson('/api/new-batch', {{}});
+        await refresh();
+        await refreshPendingStatus();
+        alert('已初始化新一批；目前清單 ' + data.count + ' 筆');
       }} catch (error) {{
         alert(error.message);
       }}
@@ -3131,10 +3160,11 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const now = browserServerNow();
       const total = Number(status.total || current.total || 0);
       const done = Number(status.done || 0);
+      const capacity = Number(status.capacity || 0);
       const percent = total > 0 ? Math.round((done / total) * 100) : 0;
       const phase = current.phase || status.state || '待命';
       const isWatchMode = status.mode === 'watch';
-      const isWatchIdle = isWatchMode && status.running && !current.filename && /監看中/.test(phase);
+      const isWatchIdle = isWatchMode && status.running && !current.filename && /監看中|完成/.test(phase);
       const retryRemaining = current.retry_until ? Math.max(0, Math.ceil(Number(current.retry_until) - now)) : 0;
       const startedAt = Number(current.started_at || current.updated_at || now);
       const elapsed = Math.max(0, now - startedAt);
@@ -3156,7 +3186,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         : '';
       currentSub.textContent = attempts || (
         isWatchIdle
-          ? '目前批次已處理完成，正在等待新照片。若不需要繼續監看，按「停止」。'
+          ? '目前資料夾照片已處理完成；容量上限 ' + (capacity || total || '-') + ' 張。若要換新一批，先按「停止」，更換資料夾內容後按「新一批」。'
           : (status.running ? '程式仍在執行，請等候目前 API 回應。' : '開始後會顯示目前處理到哪張照片與 API 狀態。')
       );
 
@@ -3187,7 +3217,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       }}
       stateText.textContent = status.state || '待命';
       countText.textContent = status.mode === 'watch'
-        ? ' 已處理 ' + (status.done || 0) + ' / 上限 ' + (status.total || 0)
+        ? ' 已處理 ' + (status.done || 0) + ' / ' + (status.total || 0) + ' · 容量上限 ' + (status.capacity || internalDefaults.max_images)
         : ' ' + (status.done || 0) + ' / ' + (status.total || 0);
       progress.max = Math.max(status.total || 1, 1);
       progress.value = status.done || 0;
@@ -3260,6 +3290,7 @@ def run_web_gui(port: int = 8765) -> None:
         "state": "待命",
         "done": 0,
         "total": 0,
+        "capacity": MAX_IMAGES,
         "logs": [],
         "results": [],
         "completed_sources": set(),
@@ -3288,10 +3319,12 @@ def run_web_gui(port: int = 8765) -> None:
             error_count = len([result for result in results_copy if result.status == "error"])
             total = int(app_state["total"])
             done = int(app_state["done"])
+            capacity = int(app_state.get("capacity", MAX_IMAGES) or MAX_IMAGES)
             return {
                 "state": app_state["state"],
                 "done": done,
                 "total": total,
+                "capacity": capacity,
                 "ok_count": ok_count,
                 "error_count": error_count,
                 "remaining": max(total - done, 0),
@@ -3382,10 +3415,11 @@ def run_web_gui(port: int = 8765) -> None:
             if kind == "scan":
                 mode = str(payload.get("mode", "batch"))
                 total = int(payload["total"])
+                capacity = int(payload.get("capacity", config.max_images))
                 phase = "監看中" if mode == "watch" else "掃描完成，準備開始"
-                set_state(total=total, done=0, state=("監看中" if mode == "watch" else "執行中"), mode=mode)
+                set_state(total=total, capacity=capacity, done=0, state=("監看中" if mode == "watch" else "執行中"), mode=mode)
                 set_current(current_progress_payload(phase, total=total))
-                add_log(f"監看上限 {total} 張；放入新照片後會自動分析。" if mode == "watch" else f"找到 {total} 張")
+                add_log(f"資料夾上限 {capacity} 張；放入新照片後會自動分析。" if mode == "watch" else f"找到 {total} 張")
             elif kind == "log":
                 add_log(redact_sensitive(payload, [config.api_key]))
             elif kind == "current":
@@ -3401,15 +3435,15 @@ def run_web_gui(port: int = 8765) -> None:
                             app_state["completed_sources"].add(source_token)
             elif kind == "saved":
                 if watch_mode:
-                    total_limit = config.max_images
                     count = int(payload.get("count", 0) or 0)
-                    set_state(manifest=payload, state="監看中", done=count, total=total_limit, mode="watch")
-                    set_current(current_progress_payload("監看中", total=total_limit))
-                    add_log(f"目前批次完成，已處理 {count} 張；繼續監看新照片。")
+                    total_count = max(int(app_state.get("total") or 0), count)
+                    set_state(manifest=payload, state="完成", done=count, total=total_count, capacity=config.max_images, mode="watch")
+                    set_current(current_progress_payload("完成", total=total_count))
+                    add_log(f"目前資料夾照片已完成，已處理 {count} / {total_count} 張；仍可繼續監看新照片。")
                     if has_reanalyze_queue():
                         drain_reanalyze_queue(stop_event)
-                        set_state(state="監看中", mode="watch", running=True)
-                        set_current(current_progress_payload("監看中", total=total_limit))
+                        set_state(state="完成", mode="watch", running=True)
+                        set_current(current_progress_payload("完成", total=total_count))
                 else:
                     set_state(manifest=payload, state="完成")
                     set_current(current_progress_payload("完成", total=int(payload.get("count", 0) or 0)))
@@ -3417,8 +3451,8 @@ def run_web_gui(port: int = 8765) -> None:
             elif kind == "watch_idle":
                 if watch_mode and has_reanalyze_queue():
                     drain_reanalyze_queue(stop_event)
-                    set_state(state="監看中", mode="watch", running=True)
-                    set_current(current_progress_payload("監看中", total=config.max_images))
+                    set_state(state="完成", mode="watch", running=True)
+                    set_current(current_progress_payload("完成", total=int(app_state.get("total") or 0)))
             elif kind == "done":
                 final_state = "已停止" if watch_mode and stop_event.is_set() else "完成"
                 set_state(manifest=payload, state=final_state)
@@ -4065,6 +4099,34 @@ def run_web_gui(port: int = 8765) -> None:
                     add_log(f"已載入 {len(pending_results)} 筆進度。")
                     self.send_json({"ok": True, "count": len(pending_results)})
                     return
+                if parsed.path == "/api/new-batch":
+                    with state_lock:
+                        if app_state["running"]:
+                            self.send_json({"error": "請先按「停止」或等目前工作完成，再初始化新一批。"}, 409)
+                            return
+                        app_state.update(
+                            {
+                                "state": "待命",
+                                "done": 0,
+                                "total": 0,
+                                "capacity": MAX_IMAGES,
+                                "logs": [],
+                                "results": [],
+                                "completed_sources": set(),
+                                "thumbnail_cache": {},
+                                "current": current_progress_payload("待命"),
+                                "manifest": {},
+                                "mode": "",
+                                "reanalyze_queue": [],
+                                "next_reanalyze_id": 1,
+                                "stop_event": None,
+                                "worker": None,
+                            }
+                        )
+                    save_pending_results([], set())
+                    add_log("已初始化新一批。")
+                    self.send_json({"ok": True, "count": 0})
+                    return
                 if parsed.path == "/api/delete-result":
                     payload = self.read_json()
                     target_index = int(payload.get("index", 0) or 0)
@@ -4083,6 +4145,7 @@ def run_web_gui(port: int = 8765) -> None:
                         if not app_state["running"]:
                             app_state["done"] = len(app_state["results"])
                             app_state["total"] = len(app_state["results"])
+                            app_state["capacity"] = MAX_IMAGES
                             app_state["current"] = current_progress_payload("已刪除一筆", total=len(app_state["results"]))
                         results_copy = list(app_state["results"])
                         completed_sources = set(app_state["completed_sources"])
