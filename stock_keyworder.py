@@ -2463,6 +2463,65 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     button.primary {{ background: var(--primary); color: #fff; }}
     button.danger {{ background: #fee4e2; color: var(--danger); }}
     button:disabled {{ opacity: 0.55; cursor: not-allowed; }}
+    button.busy {{
+      position: relative;
+      opacity: 0.72;
+    }}
+    button.busy::after {{
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-left: 7px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      vertical-align: -1px;
+      animation: spin 0.8s linear infinite;
+    }}
+    .action-status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      max-width: min(58vw, 620px);
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }}
+    .action-status.busy {{
+      color: #175cd3;
+      border-color: #bfdbfe;
+      background: #eff6ff;
+    }}
+    .action-status.busy::before {{
+      content: "";
+      width: 9px;
+      height: 9px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex: 0 0 auto;
+    }}
+    .action-status.success {{
+      color: var(--ok);
+      border-color: #99d8ce;
+      background: #f0fdfa;
+    }}
+    .action-status.error {{
+      color: var(--danger);
+      border-color: #f5b7b1;
+      background: #fff7f6;
+    }}
+    @keyframes spin {{
+      to {{ transform: rotate(360deg); }}
+    }}
     .statusrow {{
       display: flex;
       align-items: center;
@@ -2719,7 +2778,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
 <body>
   <header>
     <h1>{APP_NAME}</h1>
-    <div id="serverStatus" class="hint">本機瀏覽器介面</div>
+    <div id="serverStatus" class="action-status idle">本機瀏覽器介面</div>
   </header>
   <main>
     <form id="settingsForm">
@@ -2856,6 +2915,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const promptList = document.getElementById('promptList');
     const keyStatus = document.getElementById('keyStatus');
     const pendingStatus = document.getElementById('pendingStatus');
+    const serverStatus = document.getElementById('serverStatus');
     const internalDefaults = {{
       max_images: {MAX_IMAGES},
       max_side: 1600,
@@ -2875,110 +2935,158 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     let lastLogText = '';
     let copyStore = new Map();
     let copySeq = 0;
+    let actionStatusTimer = 0;
+
+    function setActionStatus(message, tone = 'idle', holdMs = 0) {{
+      window.clearTimeout(actionStatusTimer);
+      serverStatus.textContent = message || '本機瀏覽器介面';
+      serverStatus.className = 'action-status ' + tone;
+      if (holdMs > 0) {{
+        actionStatusTimer = window.setTimeout(() => {{
+          serverStatus.textContent = lastStatus && lastStatus.running ? '工作執行中' : '本機瀏覽器介面';
+          serverStatus.className = 'action-status idle';
+        }}, holdMs);
+      }}
+    }}
+
+    function setButtonBusy(button, label) {{
+      if (!button) return () => {{}};
+      const oldText = button.textContent;
+      const oldDisabled = button.disabled;
+      button.disabled = true;
+      button.classList.add('busy');
+      if (label) button.textContent = label;
+      return () => {{
+        button.disabled = oldDisabled;
+        button.classList.remove('busy');
+        button.textContent = oldText;
+      }};
+    }}
+
+    async function runAction(button, busyText, successText, task, options = {{}}) {{
+      const restoreButton = setButtonBusy(button, busyText);
+      setActionStatus(busyText, 'busy');
+      try {{
+        const data = await task();
+        const message = typeof successText === 'function' ? successText(data) : successText;
+        if (message) setActionStatus(message, 'success', options.holdMs ?? 1500);
+        return data;
+      }} catch (error) {{
+        const message = error && error.message ? error.message : String(error || '動作失敗');
+        setActionStatus(message, 'error', options.errorHoldMs ?? 5000);
+        return null;
+      }} finally {{
+        restoreButton();
+      }}
+    }}
 
     document.getElementById('chooseFolderBtn').onclick = async () => {{
       const button = document.getElementById('chooseFolderBtn');
-      const oldText = button.textContent;
-      button.disabled = true;
-      button.textContent = '選擇中...';
-      try {{
+      await runAction(button, '選擇中...', data => data && data.folder ? '資料夾已選擇' : '已取消選擇資料夾', async () => {{
         const data = await postJson('/api/select-folder', {{}});
         if (data.folder) {{
           form.folder.value = data.folder;
         }}
-      }} catch (error) {{
-        alert(error.message);
-      }} finally {{
-        button.disabled = false;
-        button.textContent = oldText;
-      }}
+        return data;
+      }});
     }};
 
-    document.getElementById('defaultPrompt').onclick = () => form.prompt.value = defaultPrompt;
+    document.getElementById('defaultPrompt').onclick = (event) => {{
+      form.prompt.value = defaultPrompt;
+      setActionStatus('已套用通用模板', 'success', 1200);
+      event.currentTarget.blur();
+    }};
     document.getElementById('savePromptBtn').onclick = async () => {{
-      try {{
+      const button = document.getElementById('savePromptBtn');
+      await runAction(button, '儲存中...', 'Prompt 已儲存', async () => {{
         await postJson('/api/save-prompt', {{name: form.prompt_name.value, prompt: form.prompt.value}});
         await loadPromptList();
-        alert('Prompt 已儲存');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+      }});
     }};
     document.getElementById('loadPromptBtn').onclick = async () => {{
-      try {{
+      const button = document.getElementById('loadPromptBtn');
+      await runAction(button, '載入中...', 'Prompt 已載入', async () => {{
         const name = promptList.value || form.prompt_name.value;
         const data = await postJson('/api/load-prompt', {{name}});
         form.prompt.value = data.prompt || '';
         form.prompt_name.value = data.name || name;
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        return data;
+      }});
     }};
     document.getElementById('deletePromptBtn').onclick = async () => {{
-      try {{
-        const name = promptList.value || form.prompt_name.value;
-        if (!name) throw new Error('請先選擇或輸入 Prompt 名稱');
-        if (!confirm('確定刪除 Prompt：' + name + '？')) return;
+      const button = document.getElementById('deletePromptBtn');
+      const name = promptList.value || form.prompt_name.value;
+      if (!name) {{
+        setActionStatus('請先選擇或輸入 Prompt 名稱', 'error', 3000);
+        return;
+      }}
+      if (!confirm('確定刪除 Prompt：' + name + '？')) {{
+        setActionStatus('已取消刪除 Prompt', 'idle', 1200);
+        return;
+      }}
+      await runAction(button, '刪除中...', 'Prompt 已刪除', async () => {{
         await postJson('/api/delete-prompt', {{name}});
         form.prompt_name.value = '';
         await loadPromptList();
-        alert('Prompt 已刪除');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+      }});
     }};
-    document.getElementById('keyStatusBtn').onclick = () => refreshKeyStatus();
+    document.getElementById('keyStatusBtn').onclick = async () => {{
+      const button = document.getElementById('keyStatusBtn');
+      await runAction(button, '檢查中...', 'API Key 暫存狀態已更新', () => refreshKeyStatus());
+    }};
     document.getElementById('saveProgressBtn').onclick = async () => {{
-      try {{
+      const button = document.getElementById('saveProgressBtn');
+      await runAction(button, '儲存中...', data => '已儲存 ' + data.count + ' 筆進度', async () => {{
         const data = await postJson('/api/save-progress', {{}});
         await refreshPendingStatus();
-        alert('已儲存 ' + data.count + ' 筆進度');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        return data;
+      }});
     }};
     document.getElementById('loadProgressBtn').onclick = async () => {{
-      try {{
-        if (!confirm('載入進度會覆蓋目前畫面清單，確定繼續？')) return;
+      const button = document.getElementById('loadProgressBtn');
+      if (!confirm('載入進度會覆蓋目前畫面清單，確定繼續？')) {{
+        setActionStatus('已取消載入進度', 'idle', 1200);
+        return;
+      }}
+      await runAction(button, '載入中...', data => '已載入 ' + data.count + ' 筆進度', async () => {{
         const data = await postJson('/api/load-progress', {{}});
         await refresh();
         await refreshPendingStatus();
-        alert('已載入 ' + data.count + ' 筆進度');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        return data;
+      }});
     }};
     document.getElementById('resumeProgressBtn').onclick = async () => {{
-      try {{
+      const button = document.getElementById('resumeProgressBtn');
+      await runAction(button, '送出中...', '已送出續跑，等待 AI 回應', async () => {{
         await postJson('/api/resume', formPayload());
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        await refresh();
+      }});
     }};
     document.getElementById('newBatchBtn').onclick = async () => {{
-      try {{
-        if (!confirm('新一批會清空目前畫面與進度狀態，但不會刪除原始照片。請先更換或清空照片資料夾後再開始下一批。確定初始化？')) return;
+      const button = document.getElementById('newBatchBtn');
+      if (!confirm('新一批會清空目前畫面與進度狀態，但不會刪除原始照片。請先更換或清空照片資料夾後再開始下一批。確定初始化？')) {{
+        setActionStatus('已取消初始化新一批', 'idle', 1200);
+        return;
+      }}
+      await runAction(button, '初始化中...', data => '已初始化新一批；目前清單 ' + data.count + ' 筆', async () => {{
         const data = await postJson('/api/new-batch', {{}});
         await refresh();
         await refreshPendingStatus();
-        alert('已初始化新一批；目前清單 ' + data.count + ' 筆');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        return data;
+      }});
     }};
     document.getElementById('clearKeyBtn').onclick = async () => {{
-      try {{
+      const button = document.getElementById('clearKeyBtn');
+      await runAction(button, '清除中...', '已清除本機暫存 API key', async () => {{
         await postJson('/api/clear-key', {{provider: form.provider.value}});
         await refreshKeyStatus();
-        alert('已清除本機暫存 API key');
-      }} catch (error) {{
-        alert(error.message);
-      }}
+      }});
     }};
     form.provider.addEventListener('change', () => {{
       syncModelForProvider();
       refreshModelSuggestions();
       refreshKeyStatus();
+      setActionStatus('已切換 Provider：' + form.provider.value, 'success', 1200);
     }});
 
     function detectModelProvider(model) {{
@@ -3024,14 +3132,20 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
 
     form.onsubmit = async (event) => {{
       event.preventDefault();
-      try {{
+      const button = document.getElementById('startBtn');
+      await runAction(button, '啟動中...', '已開始，等待第一張照片狀態', async () => {{
         await postJson('/api/start', formPayload());
-      }} catch (error) {{
-        alert(error.message);
-      }}
+        await refresh();
+      }});
     }};
 
-    document.getElementById('stopBtn').onclick = () => postJson('/api/stop').catch(error => alert(error.message));
+    document.getElementById('stopBtn').onclick = async () => {{
+      const button = document.getElementById('stopBtn');
+      await runAction(button, '停止中...', '已送出停止要求', async () => {{
+        await postJson('/api/stop');
+        await refresh();
+      }});
+    }};
     async function copyTextToClipboard(text) {{
       if (navigator.clipboard && window.isSecureContext) {{
         await navigator.clipboard.writeText(text);
@@ -3054,12 +3168,15 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         const oldText = copyButton.textContent;
         copyButton.textContent = '已複製';
         copyButton.disabled = true;
+        setActionStatus('複製中...', 'busy');
         const copyId = copyButton.getAttribute('data-copy-id') || '';
         const text = copyId ? (copyStore.get(copyId) || '') : (copyButton.getAttribute('data-copy') || '');
         try {{
           await copyTextToClipboard(text);
+          setActionStatus('已複製到剪貼簿', 'success', 900);
         }} catch (error) {{
           copyButton.textContent = '複製失敗';
+          setActionStatus('複製失敗，請再試一次', 'error', 3000);
           setTimeout(() => {{
             copyButton.textContent = oldText;
             copyButton.disabled = false;
@@ -3081,25 +3198,31 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           ''
         );
         if (!correction || !correction.trim()) return;
-        await postJson('/api/reanalyze-result', {{
-          ...formPayload(),
-          index: Number(reanalyzeButton.getAttribute('data-reanalyze-index') || 0),
-          correction: correction.trim()
+        await runAction(reanalyzeButton, '排入中...', '已排入修正重辨：' + filename, async () => {{
+          await postJson('/api/reanalyze-result', {{
+            ...formPayload(),
+            index: Number(reanalyzeButton.getAttribute('data-reanalyze-index') || 0),
+            correction: correction.trim()
+          }});
+          await refresh();
         }});
-        await refresh();
-        alert('已排入修正重辨：' + filename);
         return;
       }}
 
       const deleteButton = event.target.closest('button[data-delete-index]');
       if (!deleteButton) return;
       const filename = deleteButton.getAttribute('data-filename') || '此筆資料';
-      if (!confirm('只會從清單移除，不會刪除原始照片。確定刪除：' + filename + '？')) return;
-      await postJson('/api/delete-result', {{
-        index: Number(deleteButton.getAttribute('data-delete-index') || 0)
+      if (!confirm('只會從清單移除，不會刪除原始照片。確定刪除：' + filename + '？')) {{
+        setActionStatus('已取消刪除', 'idle', 1200);
+        return;
+      }}
+      await runAction(deleteButton, '刪除中...', '已從清單移除：' + filename, async () => {{
+        await postJson('/api/delete-result', {{
+          index: Number(deleteButton.getAttribute('data-delete-index') || 0)
+        }});
+        await refresh();
+        await refreshPendingStatus();
       }});
-      await refresh();
-      await refreshPendingStatus();
     }});
 
     function esc(value) {{
