@@ -4,41 +4,37 @@ setlocal
 cd /d "%~dp0"
 echo Starting Stock Keyworder...
 
+set "PYTHON_LAUNCHER="
+
 where py >nul 2>nul
 if not errorlevel 1 (
-  set "PYTHON_LAUNCHER=py"
-) else (
-  where python >nul 2>nul
-  if errorlevel 1 (
-    echo Python was not found. Install Python 3 first:
-    echo https://www.python.org/downloads/
-    pause
-    exit /b 1
-  )
-  set "PYTHON_LAUNCHER=python"
+  py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
+  if not errorlevel 1 set "PYTHON_LAUNCHER=py -3"
 )
 
-%PYTHON_LAUNCHER% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
-if errorlevel 1 (
-  echo Python 3.9 or newer is required.
+if not defined PYTHON_LAUNCHER (
+  where python >nul 2>nul
+  if not errorlevel 1 (
+    python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
+    if not errorlevel 1 set "PYTHON_LAUNCHER=python"
+  )
+)
+
+if not defined PYTHON_LAUNCHER (
+  echo Python 3.9 or newer was not found. Install Python 3 first:
   echo https://www.python.org/downloads/
   pause
   exit /b 1
 )
 
-if not exist ".venv\Scripts\python.exe" (
-  echo Creating virtual environment...
-  %PYTHON_LAUNCHER% -m venv .venv
-)
-
-call ".venv\Scripts\activate.bat"
 set "PYTHONUTF8=1"
 
-python -c "import PIL" >nul 2>nul
+%PYTHON_LAUNCHER% setup_environment.py --run
 if errorlevel 1 (
-  echo Installing requirements...
-  python -m pip install -r requirements.txt
+  echo.
+  echo Stock Keyworder exited with an error.
+  pause
+  exit /b 1
 )
 
-python stock_keyworder.py
 pause

@@ -17,25 +17,33 @@
 
 ## 安裝
 
+每台新電腦只需要先安裝 Python 3.9 以上，之後執行啟動檔即可。啟動檔會自動檢查環境、建立 `.venv`、安裝/更新 requirements，然後開啟程式。
+
 macOS:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python stock_keyworder.py
+./start_mac.command
 ```
 
-Windows PowerShell:
+Windows:
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python stock_keyworder.py
+.\start_windows.bat
 ```
 
-`Pillow` 用於壓縮送給 API 的照片與產生縮圖。沒有 Pillow 時程式仍可嘗試執行，但批次成本、速度與報表縮圖品質會比較差。
+如果只想初始化環境、不啟動程式，可執行：
+
+```bash
+python3 setup_environment.py
+```
+
+Windows:
+
+```powershell
+py -3 setup_environment.py
+```
+
+`Pillow` 用於壓縮送給 API 的照片與產生縮圖。啟動檔會自動安裝 requirements；如果套件變更或環境損壞，再次執行啟動檔會自動修復。
 
 ## API Key
 
