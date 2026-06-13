@@ -63,8 +63,38 @@ PROVIDER_DEFAULT_MODELS = {
     "gemini": "gemini-3.5-flash",
 }
 PROVIDER_MODEL_SUGGESTIONS = {
-    "openai": ["gpt-5.5"],
-    "gemini": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+    "openai": ["gpt-5.5", "gpt-4o-mini", "gpt-4o"],
+    "gemini": [
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-pro",
+    ],
+}
+MODEL_ALIASES = {
+    "gpt-4o-mini": "gpt-4o-mini",
+    "gpt4o-mini": "gpt-4o-mini",
+    "gpt-4omini": "gpt-4o-mini",
+    "gpt4omini": "gpt-4o-mini",
+    "gpt-4o mini": "gpt-4o-mini",
+    "gpt 4o mini": "gpt-4o-mini",
+    "4o-mini": "gpt-4o-mini",
+    "3.1flash-light": "gemini-3.1-flash-lite",
+    "3.1flashlight": "gemini-3.1-flash-lite",
+    "3.1 flash-light": "gemini-3.1-flash-lite",
+    "3.1 flash light": "gemini-3.1-flash-lite",
+    "3.1-flash-light": "gemini-3.1-flash-lite",
+    "gemini 3.1 flash light": "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-light": "gemini-3.1-flash-lite",
+    "3.1flash-lite": "gemini-3.1-flash-lite",
+    "3.1flashlite": "gemini-3.1-flash-lite",
+    "3.1 flash-lite": "gemini-3.1-flash-lite",
+    "3.1 flash lite": "gemini-3.1-flash-lite",
+    "3.1-flash-lite": "gemini-3.1-flash-lite",
+    "gemini 3.1 flash lite": "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
 }
 CONFIG_PATH = Path.home() / ".stock_keyworder_config.json"
 USAGE_PATH = Path.home() / ".stock_keyworder_usage.json"
@@ -83,6 +113,8 @@ CAPACITY_RETRY_DELAYS = [20, 45, 90]
 DEFAULT_MAX_FILE_MB = 64
 MAX_FILE_MB = 512
 MODEL_MAX_OUTPUT_TOKENS = 3000
+DEFAULT_REUSE_SIMILAR_IMAGES = True
+DEFAULT_SIMILARITY_THRESHOLD = 7
 
 DEFAULT_PROMPT = """請為國際圖庫上架產生英文 metadata。
 
@@ -137,6 +169,8 @@ class RunConfig:
     timeout_seconds: int = 180
     retry_count: int = DEFAULT_RETRY_COUNT
     daily_limit: int = DEFAULT_DAILY_API_LIMIT
+    reuse_similar_images: bool = DEFAULT_REUSE_SIMILAR_IMAGES
+    similar_threshold: int = DEFAULT_SIMILARITY_THRESHOLD
     usage_start_count: int = 0
     api_attempts_this_run: int = 0
 
@@ -268,7 +302,7 @@ def current_progress_payload(
 
 
 def provider_for_model(model: str) -> str:
-    text = model.strip().lower()
+    text = normalize_model_alias(model).strip().lower()
     if text.startswith("gemini-"):
         return "gemini"
     if text.startswith(("gpt-", "o1", "o3", "o4", "o5", "chatgpt-")):
@@ -276,9 +310,18 @@ def provider_for_model(model: str) -> str:
     return ""
 
 
+def normalize_model_alias(model: str) -> str:
+    text = re.sub(r"\s+", " ", model.strip())
+    if not text:
+        return ""
+    key = text.casefold()
+    compact_key = re.sub(r"[\s_]+", "", key)
+    return MODEL_ALIASES.get(key) or MODEL_ALIASES.get(compact_key) or text
+
+
 def normalize_model_for_provider(provider: str, model: str) -> str:
     provider = provider.strip().lower()
-    text = model.strip()
+    text = normalize_model_alias(model)
     if not text:
         return PROVIDER_DEFAULT_MODELS.get(provider, text)
     detected_provider = provider_for_model(text)
@@ -421,12 +464,74 @@ def count_api_eligible_images(images: list[Path], max_file_mb: int) -> int:
     return len([path for path in images if is_within_file_limit(path, max_file_mb)])
 
 
+def preflight_api_call_count(config: RunConfig, images: list[Path]) -> int:
+    eligible_count = count_api_eligible_images(images, config.max_file_mb)
+    if config.reuse_similar_images and eligible_count:
+        return 1
+    return eligible_count
+
+
 def file_limit_error(path: Path, max_file_mb: int) -> str:
     try:
         size_text = f"{file_size_mb(path):.1f} MB"
     except OSError:
         size_text = "未知大小"
     return f"單檔大小 {size_text} 超過上限 {max_file_mb} MB，已跳過且未呼叫 API。"
+
+
+def image_similarity_hash(path: Path, hash_size: int = 8) -> Optional[int]:
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("L")
+            image = image.resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+            pixels = list(image.getdata())
+    except Exception:
+        return None
+
+    value = 0
+    bit = 0
+    width = hash_size + 1
+    for row in range(hash_size):
+        row_offset = row * width
+        for col in range(hash_size):
+            if pixels[row_offset + col] > pixels[row_offset + col + 1]:
+                value |= 1 << bit
+            bit += 1
+    return value
+
+
+def hash_distance(left: int, right: int) -> int:
+    return bin(int(left) ^ int(right)).count("1")
+
+
+def clone_metadata_from_similar(result: ImageResult, source: ImageResult, distance: int) -> None:
+    result.title = source.title
+    result.description = source.description
+    result.zh_summary = (
+        f"與 {source.filename} 相似：{source.zh_summary}"
+        if source.zh_summary
+        else f"與 {source.filename} 相似，已沿用 metadata。"
+    )
+    result.keywords = list(source.keywords or [])
+    result.categories = list(source.categories or [])
+    result.copy_line = source.copy_line
+    result.notes = (
+        f"本機判定與 {source.filename} 高度相似，已沿用 metadata 節省 API/token。"
+        f"相似距離 {distance}，請上架前快速確認。"
+    )
+
+
+def seed_reuse_signatures(results: list[ImageResult]) -> list[tuple[int, ImageResult]]:
+    signatures: list[tuple[int, ImageResult]] = []
+    for result in results:
+        if result.status != "ok" or not result.source_path:
+            continue
+        signature = image_similarity_hash(Path(result.source_path))
+        if signature is not None:
+            signatures.append((signature, result))
+    return signatures
 
 
 def get_effective_api_key(provider: str, api_key: str) -> str:
@@ -747,6 +852,7 @@ def prepare_run(config: RunConfig) -> str:
     if provider not in PROVIDER_DEFAULT_MODELS:
         raise ValueError("Provider 必須是 openai 或 gemini。")
     config.provider = provider
+    config.model = normalize_model_for_provider(config.provider, config.model)
 
     if config.max_images < 1 or config.max_images > MAX_IMAGES:
         raise ValueError(f"上限需介於 1 到 {MAX_IMAGES}。")
@@ -758,6 +864,8 @@ def prepare_run(config: RunConfig) -> str:
         raise ValueError("Timeout 需介於 10 到 600 秒。")
     if config.retry_count < 0 or config.retry_count > MAX_RETRY_COUNT:
         raise ValueError(f"重試次數需介於 0 到 {MAX_RETRY_COUNT}。")
+    if config.similar_threshold < 0 or config.similar_threshold > 16:
+        raise ValueError("相似圖沿用門檻需介於 0 到 16。")
     if config.daily_limit < 1 or config.daily_limit > MAX_DAILY_API_LIMIT:
         raise ValueError(f"每日 API request 上限需介於 1 到 {MAX_DAILY_API_LIMIT}。")
 
@@ -779,10 +887,12 @@ def analyze_images(
     start_index: int = 1,
     completed_before: int = 0,
     total_count: Optional[int] = None,
+    reuse_candidates: Optional[list[ImageResult]] = None,
 ) -> list[ImageResult]:
     results: list[ImageResult] = []
     total = total_count or len(images)
     capacity_error_streak = 0
+    reuse_signatures = seed_reuse_signatures(reuse_candidates or [])
     for offset, image_path in enumerate(images):
         index = start_index + offset
         if stop_event and stop_event.is_set():
@@ -827,6 +937,34 @@ def analyze_images(
                 progress("progress", {"done": completed_before + len(results), "total": total})
                 progress("log", f"  跳過 {image_path.name}：{result.error}")
             continue
+
+        if config.reuse_similar_images:
+            signature = image_similarity_hash(image_path)
+            if signature is not None:
+                similar_match: Optional[tuple[int, ImageResult]] = None
+                for previous_signature, previous_result in reuse_signatures:
+                    distance = hash_distance(signature, previous_signature)
+                    if distance <= config.similar_threshold:
+                        if similar_match is None or distance < similar_match[0]:
+                            similar_match = (distance, previous_result)
+                if similar_match is not None:
+                    distance, source_result = similar_match
+                    clone_metadata_from_similar(result, source_result, distance)
+                    results.append(result)
+                    reuse_signatures.append((signature, result))
+                    capacity_error_streak = 0
+                    if progress:
+                        progress(
+                            "current",
+                            current_progress_payload("沿用相似照片 metadata", image_path.name, index, total),
+                        )
+                        progress(
+                            "log",
+                            f"  沿用 {source_result.filename} 的 metadata，未呼叫 API：{image_path.name}",
+                        )
+                        progress("result", result)
+                        progress("progress", {"done": completed_before + len(results), "total": total})
+                    continue
 
         try:
             raw_metadata: Optional[dict[str, Any]] = None
@@ -895,6 +1033,9 @@ def analyze_images(
             result.notes = normalized["notes"]
             result.copy_line = normalized["copy_line"]
             capacity_error_streak = 0
+            signature = image_similarity_hash(image_path) if config.reuse_similar_images else None
+            if signature is not None:
+                reuse_signatures.append((signature, result))
             if progress:
                 progress(
                     "current",
@@ -948,7 +1089,7 @@ def process_folder(
 ) -> dict[str, Any]:
     api_key = prepare_run(config)
     images = discover_images(config.folder, config.max_images)
-    ensure_daily_limit(config, count_api_eligible_images(images, config.max_file_mb))
+    ensure_daily_limit(config, preflight_api_call_count(config, images))
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (
         config.output_dir or config.folder / f"stock_keyworder_output_{timestamp}"
@@ -1041,6 +1182,7 @@ def watch_folder(
                 start_index=len(results) + 1,
                 completed_before=len(results),
                 total_count=config.max_images,
+                reuse_candidates=results,
             )
             results.extend(new_results)
             for result in new_results:
@@ -2306,7 +2448,9 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       max_side: 1600,
       max_file_mb: {DEFAULT_MAX_FILE_MB},
       daily_limit: {DEFAULT_DAILY_API_LIMIT},
-      retry_count: {DEFAULT_RETRY_COUNT}
+      retry_count: {DEFAULT_RETRY_COUNT},
+      reuse_similar_images: {str(DEFAULT_REUSE_SIMILAR_IMAGES).lower()},
+      similar_threshold: {DEFAULT_SIMILARITY_THRESHOLD}
     }};
     const providerDefaults = {json.dumps(PROVIDER_DEFAULT_MODELS, ensure_ascii=False)};
     const providerModels = {json.dumps(PROVIDER_MODEL_SUGGESTIONS, ensure_ascii=False)};
@@ -2744,6 +2888,8 @@ def run_web_gui(port: int = 8765) -> None:
                 max_file_mb=int(payload.get("max_file_mb", DEFAULT_MAX_FILE_MB)),
                 retry_count=int(payload.get("retry_count", DEFAULT_RETRY_COUNT)),
                 daily_limit=int(payload.get("daily_limit", DEFAULT_DAILY_API_LIMIT)),
+                reuse_similar_images=bool(payload.get("reuse_similar_images", DEFAULT_REUSE_SIMILAR_IMAGES)),
+                similar_threshold=int(payload.get("similar_threshold", DEFAULT_SIMILARITY_THRESHOLD)),
             ),
             bool(payload.get("watch", False)),
         )
@@ -2822,7 +2968,7 @@ def run_web_gui(port: int = 8765) -> None:
 
             remaining_images = discover_remaining_images(config, existing_results, completed_sources)
             total_count = len(existing_results) + len(remaining_images)
-            ensure_daily_limit(config, count_api_eligible_images(remaining_images, config.max_file_mb))
+            ensure_daily_limit(config, preflight_api_call_count(config, remaining_images))
             set_state(total=total_count, done=len(existing_results), state="執行中")
             set_current(
                 current_progress_payload(
@@ -2845,6 +2991,7 @@ def run_web_gui(port: int = 8765) -> None:
                     start_index=len(existing_results) + 1,
                     completed_before=len(existing_results),
                     total_count=total_count,
+                    reuse_candidates=existing_results,
                 )
 
             with state_lock:
@@ -3717,7 +3864,10 @@ def run_gui() -> None:
             try:
                 prepare_run(config)
                 planned_images = self._planned_image_count(config, watch_mode)
-                ensure_daily_limit(config, 1 if watch_mode else planned_images)
+                ensure_daily_limit(
+                    config,
+                    1 if watch_mode else (1 if config.reuse_similar_images and planned_images else planned_images),
+                )
             except Exception as exc:
                 messagebox.showerror(APP_NAME, redact_sensitive(exc, [config.api_key]))
                 return False
@@ -3731,7 +3881,8 @@ def run_gui() -> None:
             message = (
                 f"{mode}將使用 {config.provider} / {config.model}\n\n"
                 f"預計 API 照片數：{planned_images}\n"
-                f"每張照片至少 1 次 API request；重試會額外消耗。\n"
+                f"每張非沿用照片至少 1 次 API request；重試會額外消耗。\n"
+                f"相似圖沿用：{'開啟' if config.reuse_similar_images else '關閉'}。\n"
                 f"目前剩餘可用量：{remaining}\n\n"
                 "API key 不會寫入設定檔或結果表。"
             )
@@ -4039,6 +4190,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRY_COUNT)
     parser.add_argument("--daily-limit", type=int, default=DEFAULT_DAILY_API_LIMIT)
+    parser.add_argument("--no-reuse-similar", action="store_true", help="關閉本機相似照片沿用 metadata 的節省 API 策略。")
+    parser.add_argument("--similar-threshold", type=int, default=DEFAULT_SIMILARITY_THRESHOLD)
     parser.add_argument("--yes", action="store_true", help="跳過大量 API 使用確認。")
     parser.add_argument("--watch", action="store_true", help="監看資料夾，新照片穩定後自動分析。")
     parser.add_argument("--watch-interval", type=float, default=5.0, help="監看輪詢秒數。")
@@ -4071,6 +4224,8 @@ def run_cli(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout,
         retry_count=args.retries,
         daily_limit=args.daily_limit,
+        reuse_similar_images=not args.no_reuse_similar,
+        similar_threshold=args.similar_threshold,
     )
 
     try:
@@ -4080,7 +4235,10 @@ def run_cli(args: argparse.Namespace) -> int:
             if args.watch
             else count_api_eligible_images(discover_images(config.folder, config.max_images), config.max_file_mb)
         )
-        ensure_daily_limit(config, 1 if args.watch else planned_images)
+        ensure_daily_limit(
+            config,
+            1 if args.watch else (1 if config.reuse_similar_images and planned_images else planned_images),
+        )
     except Exception as exc:
         print(redact_sensitive(exc, [config.api_key]), file=sys.stderr)
         return 2
@@ -4091,7 +4249,8 @@ def run_cli(args: argparse.Namespace) -> int:
             f"Provider/model: {config.provider} / {config.model}\n"
             f"Planned API images: {planned_images}\n"
             f"Max file size: {config.max_file_mb} MB; larger files are skipped without API calls.\n"
-            f"Each image uses at least 1 API request; retries use more.\n"
+            f"Each non-reused image uses at least 1 API request; retries use more.\n"
+            f"Similar image reuse: {'on' if config.reuse_similar_images else 'off'}.\n"
             f"Daily limit: {config.daily_limit}; remaining now: {remaining}\n"
             "Type YES to continue: "
         )

@@ -6,10 +6,11 @@
 
 - 選擇照片資料夾後批次分析，單次上限 500 張。
 - 可切換 `openai` / `gemini` provider。
-- 可直接調整模型名稱。
+- 可直接調整模型名稱，內建 `gpt-4o-mini`、`gpt-4o`、Gemini Flash / Flash-Lite 等常用選項與別名。
 - 可輸入自訂 prompt，對應各圖庫的 title、description、keywords 規則。
 - 可用監看模式，照片放入資料夾後自動加入分析佇列。
 - 單檔大小預設上限 64MB，超過會跳過且不呼叫 API。
+- 預設啟用本機相似圖沿用：同批或續跑中若判定照片高度相似，會沿用前一張 metadata，不再呼叫 API，降低 500 張批次的 token/request 消耗。
 - 右側結果表直接顯示縮圖、檔名、中文摘要、標題、描述、關鍵字、備註與複製按鈕。
 - 進度區會顯示目前檔名、API 嘗試次數、已等待時間、重試倒數、完成/錯誤/剩餘統計，避免長時間 API 等待被誤認為當機。
 - 可儲存/載入進度，並從已完成紀錄續跑未完成照片。
@@ -88,7 +89,8 @@ python stock_keyworder.py \
 - 單次資料夾上限固定為 500 張。
 - GUI 內建單檔大小安全上限，超過上限的照片會列入錯誤列，但不會送 API。
 - GUI 預設每日 API request 安全上限為 600：500 張照片 + 100 次重試緩衝，避免 API key 被誤用或濫用；CLI 可用 `--daily-limit` 調整。
-- 每張照片至少消耗 1 次 API request；如果啟用重試，失敗重試也會計入每日上限。
+- 每張非沿用照片至少消耗 1 次 API request；如果啟用重試，失敗重試也會計入每日上限。
+- 相似圖沿用只在本機用縮圖雜湊判斷，不會上傳第二張相似照片。沿用列會在 notes 標示來源檔名與相似距離，方便上架前確認。
 - 若模型回 `503 high demand` 或暫時限流，程式會改用較長等待重試；連續滿載時會先暫停批次，避免整批 500 張都變成錯誤。
 - 大量批次或監看模式啟動前會要求確認。CLI 在非互動環境需加 `--yes` 才會執行大量或監看工作。
 - 本機用量記錄存在 `~/.stock_keyworder_usage.json`，只記錄日期、provider/model 與 request 次數，不含照片內容或 API key。
@@ -143,6 +145,10 @@ GUI 介面分成四個區塊：
 7. 若某列因模型輸出格式錯誤而失敗，續跑時會移除該錯誤列並重新嘗試。
 8. 若 Gemini 顯示模型滿載，先等幾分鐘後按 `繼續未完成`；也可以改用下拉建議中的其他 Gemini 模型或 OpenAI。
 
+模型欄位可直接輸入模型名稱。OpenAI 可用 `gpt-4o-mini`；Gemini 可用官方 `gemini-3.1-flash-lite`，程式也接受 `3.1flash-light`、`3.1flash-lite` 這類常見輸入並自動轉成 `gemini-3.1-flash-lite`。若 API 回覆模型不存在，請改用下拉清單中同 provider 的其他模型。
+
+重複或相似圖組的節省策略預設開啟。程式會先用本機縮圖雜湊比對已完成照片；距離在安全門檻內時，直接沿用前一張的 title、description、keywords 與 copy line，該張不會送 API。這適合連拍、同場景小幅構圖差異或同物件不同裁切；若照片內容其實不同，請在表格中刪除該列後調整 prompt 或關閉 CLI 的 `--no-reuse-similar` 重新跑。
+
 Prompt 可在介面輸入 `Prompt 檔名` 後按 `儲存 Prompt`，之後從下拉選單選擇並按 `載入 Prompt`。不需要的 Prompt 可從下拉選單選取後按 `刪除 Prompt`。Prompt 檔會存在：
 
 ```text
@@ -167,7 +173,17 @@ Gemini 範例：
 python stock_keyworder.py \
   --folder ./photos \
   --provider gemini \
-  --model gemini-3.5-flash
+  --model gemini-3.1-flash-lite
+```
+
+關閉相似圖沿用：
+
+```bash
+python stock_keyworder.py \
+  --folder ./photos \
+  --provider openai \
+  --model gpt-4o-mini \
+  --no-reuse-similar
 ```
 
 使用 prompt 檔案：
