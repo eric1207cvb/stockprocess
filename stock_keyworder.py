@@ -3100,7 +3100,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       if (/503|high demand|滿載|UNAVAILABLE/i.test(message)) {{
         return '模型目前滿載，這張尚未完成；稍後按「繼續未完成」即可重新嘗試。';
       }}
-      if (/只回傳了關鍵字清單|缺少程式需要的 JSON|不是完整有效 JSON|JSON 不是 object/i.test(message)) {{
+      if (/只回傳了關鍵字清單|缺少程式需要的 JSON|模型回應不是 JSON|不是完整有效 JSON|JSON 不是 object/i.test(message)) {{
         return '模型輸出格式不符合：它只回傳關鍵字或不是完整 JSON。請調整 Prompt 後續跑，或按「修正重辨」。';
       }}
       if (item.status !== 'ok') return '這張尚未完成，請查看錯誤原因後稍後續跑。';
