@@ -1365,6 +1365,17 @@ def load_prompt_file(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def delete_prompt_file(name: str) -> str:
+    safe_name = safe_prompt_name(name)
+    if safe_name == "default":
+        raise ValueError("請先選擇或輸入要刪除的 Prompt 名稱。")
+    path = prompt_file_path(safe_name)
+    if not path.exists():
+        raise ValueError(f"找不到 Prompt 檔：{safe_name}")
+    path.unlink()
+    return safe_name
+
+
 def key_account(provider: str) -> str:
     provider = provider.strip().lower() or "default"
     return f"stock_keyworder_{provider}_api_key"
@@ -1731,6 +1742,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           <button type="button" id="savePromptBtn">儲存 Prompt</button>
           <select id="promptList" style="width:auto; min-width:180px"></select>
           <button type="button" id="loadPromptBtn">載入 Prompt</button>
+          <button type="button" id="deletePromptBtn">刪除 Prompt</button>
         </div>
         <textarea name="prompt">{prompt}</textarea>
         <div class="hint">Prompt 會存到本機資料夾 ~/.stock_keyworder_prompts/。</div>
@@ -1808,6 +1820,19 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
         const data = await postJson('/api/load-prompt', {{name}});
         form.prompt.value = data.prompt || '';
         form.prompt_name.value = data.name || name;
+      }} catch (error) {{
+        alert(error.message);
+      }}
+    }};
+    document.getElementById('deletePromptBtn').onclick = async () => {{
+      try {{
+        const name = promptList.value || form.prompt_name.value;
+        if (!name) throw new Error('請先選擇或輸入 Prompt 名稱');
+        if (!confirm('確定刪除 Prompt：' + name + '？')) return;
+        await postJson('/api/delete-prompt', {{name}});
+        form.prompt_name.value = '';
+        await loadPromptList();
+        alert('Prompt 已刪除');
       }} catch (error) {{
         alert(error.message);
       }}
@@ -2179,6 +2204,12 @@ def run_web_gui(port: int = 8765) -> None:
                     payload = self.read_json()
                     name = str(payload.get("name", "default")).strip() or "default"
                     self.send_json({"ok": True, "name": safe_prompt_name(name), "prompt": load_prompt_file(name)})
+                    return
+                if parsed.path == "/api/delete-prompt":
+                    payload = self.read_json()
+                    name = str(payload.get("name", "")).strip()
+                    deleted_name = delete_prompt_file(name)
+                    self.send_json({"ok": True, "name": deleted_name, "prompts": list_prompt_files()})
                     return
                 if parsed.path == "/api/clear-key":
                     payload = self.read_json()

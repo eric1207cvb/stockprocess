@@ -115,7 +115,7 @@ GUI 介面分成四個區塊：
 
 若來不及把全部照片登入到圖庫，可按 `儲存進度`。下次啟動後按 `載入進度`，會恢復上次剩餘清單。進度存在本機 `~/.stock_keyworder_pending.json`，最多保存 500 筆，不包含 API key。
 
-Prompt 可在介面輸入 `Prompt 檔名` 後按 `儲存 Prompt`，之後從下拉選單選擇並按 `載入 Prompt`。Prompt 檔會存在：
+Prompt 可在介面輸入 `Prompt 檔名` 後按 `儲存 Prompt`，之後從下拉選單選擇並按 `載入 Prompt`。不需要的 Prompt 可從下拉選單選取後按 `刪除 Prompt`。Prompt 檔會存在：
 
 ```text
 ~/.stock_keyworder_prompts/
