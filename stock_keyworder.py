@@ -2870,6 +2870,11 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const knownProviders = Object.keys(providerDefaults);
     let lastStatus = null;
     let serverOffsetSeconds = 0;
+    let refreshInFlight = false;
+    let lastResultsSignature = '';
+    let lastLogText = '';
+    let copyStore = new Map();
+    let copySeq = 0;
 
     document.getElementById('chooseFolderBtn').onclick = async () => {{
       const button = document.getElementById('chooseFolderBtn');
@@ -3027,13 +3032,44 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }};
 
     document.getElementById('stopBtn').onclick = () => postJson('/api/stop').catch(error => alert(error.message));
+    async function copyTextToClipboard(text) {{
+      if (navigator.clipboard && window.isSecureContext) {{
+        await navigator.clipboard.writeText(text);
+        return;
+      }}
+      const field = document.createElement('textarea');
+      field.value = text;
+      field.setAttribute('readonly', '');
+      field.style.position = 'fixed';
+      field.style.left = '-9999px';
+      document.body.appendChild(field);
+      field.select();
+      document.execCommand('copy');
+      document.body.removeChild(field);
+    }}
+
     document.addEventListener('click', async (event) => {{
-      const copyButton = event.target.closest('button[data-copy]');
+      const copyButton = event.target.closest('button[data-copy-id], button[data-copy]');
       if (copyButton) {{
-        await navigator.clipboard.writeText(copyButton.getAttribute('data-copy') || '');
         const oldText = copyButton.textContent;
         copyButton.textContent = '已複製';
-        setTimeout(() => copyButton.textContent = oldText, 800);
+        copyButton.disabled = true;
+        const copyId = copyButton.getAttribute('data-copy-id') || '';
+        const text = copyId ? (copyStore.get(copyId) || '') : (copyButton.getAttribute('data-copy') || '');
+        try {{
+          await copyTextToClipboard(text);
+        }} catch (error) {{
+          copyButton.textContent = '複製失敗';
+          setTimeout(() => {{
+            copyButton.textContent = oldText;
+            copyButton.disabled = false;
+          }}, 1000);
+          return;
+        }}
+        setTimeout(() => {{
+          copyButton.textContent = oldText;
+          copyButton.disabled = false;
+        }}, 500);
         return;
       }}
 
@@ -3139,6 +3175,17 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       return group.copy_line || [item.title || '', item.description || '', groupKeywordText(group)].join('\\t');
     }}
 
+    function registerCopyText(text) {{
+      copySeq += 1;
+      const id = String(copySeq);
+      copyStore.set(id, String(text ?? ''));
+      return id;
+    }}
+
+    function copyButton(label, text) {{
+      return `<button type="button" data-copy-id="${{esc(registerCopyText(text))}}">${{esc(label)}}</button>`;
+    }}
+
     function renderKeywordGroups(item) {{
       const groups = itemKeywordGroups(item);
       if (!groups.length) return '';
@@ -3175,17 +3222,17 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       const title = item.title || '';
       const description = item.description || '';
       const topButtons = [
-        `<button type="button" data-copy="${{esc(title)}}">標題</button>`,
-        `<button type="button" data-copy="${{esc(description)}}">描述</button>`,
-        `<button type="button" data-copy="${{esc([title, description].join('\\t'))}}">標題+描述</button>`
+        copyButton('標題', title),
+        copyButton('描述', description),
+        copyButton('標題+描述', [title, description].join('\\t'))
       ];
       const groupRows = [];
       groups.forEach(group => {{
         const label = group.name || 'Keywords';
         groupRows.push(`
           <div class="copy-group">
-            <button type="button" data-copy="${{esc(groupKeywordText(group))}}">${{esc(label)}}關鍵字(${{group.keywords.length}})</button>
-            <button type="button" data-copy="${{esc(groupCopyLine(item, group))}}">${{esc(label)}}整列</button>
+            ${{copyButton(label + '關鍵字(' + group.keywords.length + ')', groupKeywordText(group))}}
+            ${{copyButton(label + '整列', groupCopyLine(item, group))}}
           </div>
         `);
       }});
@@ -3195,9 +3242,54 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           <div class="copy-top-row">${{topButtons.join('')}}</div>
           <div class="copy-divider"></div>
           ${{groupRows.join('')}}
-          <button type="button" data-copy="${{esc(mainLine)}}">主整列</button>
+          ${{copyButton('主整列', mainLine)}}
         </div>
       `;
+    }}
+
+    function resultRenderSignature(items) {{
+      return JSON.stringify((items || []).map(item => [
+        item.index,
+        item.filename,
+        item.source_path,
+        item.status,
+        item.title,
+        item.description,
+        item.zh_summary,
+        item.notes,
+        item.error,
+        item.copy_line,
+        item.keywords,
+        item.keyword_groups
+      ]));
+    }}
+
+    function renderResultsTable(items) {{
+      copyStore = new Map();
+      copySeq = 0;
+      results.innerHTML = (items || []).map(item => {{
+        return `
+          <tr>
+            <td class="photo-cell">
+              <img class="row-thumb" src="${{esc(thumbnailSrc(item))}}" alt="" loading="lazy">
+              <div class="filename">${{esc(item.filename)}}</div>
+              <div class="hint">#${{esc(item.index || '')}}</div>
+              ${{renderPhotoActions(item)}}
+            </td>
+            <td class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</td>
+            <td class="zh-summary">${{esc(zhSummary(item))}}</td>
+            <td>
+              <div class="title">${{esc(item.title)}}</div>
+              <div class="description">${{esc(item.description)}}</div>
+            </td>
+            <td class="keywords">${{renderKeywordGroups(item)}}</td>
+            <td class="notes">${{esc(item.notes || item.error || '')}}</td>
+            <td class="actions">
+              ${{renderCopyButtons(item)}}
+            </td>
+          </tr>
+        `;
+      }}).join('');
     }}
 
     function formatDuration(seconds) {{
@@ -3267,47 +3359,40 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
 
     async function refresh() {{
-      const status = await fetch('/api/status').then(r => r.json());
-      lastStatus = status;
-      if (status.server_time) {{
-        serverOffsetSeconds = Number(status.server_time) - Date.now() / 1000;
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      try {{
+        const status = await fetch('/api/status').then(r => r.json());
+        lastStatus = status;
+        if (status.server_time) {{
+          serverOffsetSeconds = Number(status.server_time) - Date.now() / 1000;
+        }}
+        stateText.textContent = status.state || '待命';
+        countText.textContent = status.mode === 'watch'
+          ? ' 已處理 ' + (status.done || 0) + ' / ' + (status.total || 0) + ' · 容量上限 ' + (status.capacity || internalDefaults.max_images)
+          : ' ' + (status.done || 0) + ' / ' + (status.total || 0);
+        progress.max = Math.max(status.total || 1, 1);
+        progress.value = status.done || 0;
+        renderActivity(status);
+        const logs = status.logs || [];
+        const logText = logs.join('\\n');
+        if (logText !== lastLogText) {{
+          lastLogText = logText;
+          log.textContent = logText;
+          logSummary.textContent = logs.length ? logs.length + ' 筆' : '0 筆';
+          if (logPanel.open) {{
+            log.parentElement.scrollTop = log.parentElement.scrollHeight;
+          }}
+        }}
+        const items = status.results || [];
+        const signature = resultRenderSignature(items);
+        if (signature !== lastResultsSignature) {{
+          lastResultsSignature = signature;
+          renderResultsTable(items);
+        }}
+      }} finally {{
+        refreshInFlight = false;
       }}
-      stateText.textContent = status.state || '待命';
-      countText.textContent = status.mode === 'watch'
-        ? ' 已處理 ' + (status.done || 0) + ' / ' + (status.total || 0) + ' · 容量上限 ' + (status.capacity || internalDefaults.max_images)
-        : ' ' + (status.done || 0) + ' / ' + (status.total || 0);
-      progress.max = Math.max(status.total || 1, 1);
-      progress.value = status.done || 0;
-      renderActivity(status);
-      const logs = status.logs || [];
-      log.textContent = logs.join('\\n');
-      logSummary.textContent = logs.length ? logs.length + ' 筆' : '0 筆';
-      if (logPanel.open) {{
-        log.parentElement.scrollTop = log.parentElement.scrollHeight;
-      }}
-      results.innerHTML = (status.results || []).map(item => {{
-        return `
-          <tr>
-            <td class="photo-cell">
-              <img class="row-thumb" src="${{esc(thumbnailSrc(item))}}" alt="">
-              <div class="filename">${{esc(item.filename)}}</div>
-              <div class="hint">#${{esc(item.index || '')}}</div>
-              ${{renderPhotoActions(item)}}
-            </td>
-            <td class="${{statusClass(item)}}">${{esc(localizedStatus(item))}}</td>
-            <td class="zh-summary">${{esc(zhSummary(item))}}</td>
-            <td>
-              <div class="title">${{esc(item.title)}}</div>
-              <div class="description">${{esc(item.description)}}</div>
-            </td>
-            <td class="keywords">${{renderKeywordGroups(item)}}</td>
-            <td class="notes">${{esc(item.notes || item.error || '')}}</td>
-            <td class="actions">
-              ${{renderCopyButtons(item)}}
-            </td>
-          </tr>
-        `;
-      }}).join('');
     }}
     async function loadPromptList() {{
       const data = await fetch('/api/prompts').then(r => r.json());
