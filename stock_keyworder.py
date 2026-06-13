@@ -2380,7 +2380,7 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     }}
     .right {{
       display: grid;
-      grid-template-rows: auto minmax(260px, 1fr) minmax(160px, 0.8fr);
+      grid-template-rows: auto minmax(360px, 1fr) auto;
       gap: 12px;
       min-height: 0;
     }}
@@ -2527,6 +2527,41 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
     }}
+    .logpanel {{
+      min-height: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .logpanel summary {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 12px;
+      padding: 10px 12px;
+      cursor: pointer;
+      user-select: none;
+      font-weight: 700;
+      background: #f8fafc;
+    }}
+    .logpanel summary::-webkit-details-marker {{ display: none; }}
+    .logpanel summary::before {{
+      content: "▸";
+      color: var(--muted);
+      margin-right: 2px;
+    }}
+    .logpanel[open] summary::before {{ content: "▾"; }}
+    .logpanel summary .hint {{
+      margin-left: auto;
+      font-weight: 500;
+    }}
+    .logpanel .logwrap {{
+      border: 0;
+      border-top: 1px solid var(--line);
+      border-radius: 0;
+      max-height: clamp(120px, 22vh, 220px);
+    }}
     .log {{
       white-space: pre-wrap;
       padding: 12px;
@@ -2538,6 +2573,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     .error {{ color: var(--danger); font-weight: 650; }}
     @media (max-width: 960px) {{
       main {{ grid-template-columns: 1fr; height: auto; }}
+      .right {{ grid-template-rows: auto minmax(320px, auto) auto; }}
+      .logpanel .logwrap {{ max-height: 240px; }}
     }}
   </style>
 </head>
@@ -2650,7 +2687,10 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
           <tbody id="results"></tbody>
         </table>
       </div>
-      <div class="logwrap"><div id="log" class="log"></div></div>
+      <details id="logPanel" class="logpanel">
+        <summary><span>監測紀錄</span><span id="logSummary" class="hint">0 筆</span></summary>
+        <div class="logwrap"><div id="log" class="log"></div></div>
+      </details>
     </div>
   </main>
   <script>
@@ -2672,6 +2712,8 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
     const percentStat = document.getElementById('percentStat');
     const results = document.getElementById('results');
     const log = document.getElementById('log');
+    const logPanel = document.getElementById('logPanel');
+    const logSummary = document.getElementById('logSummary');
     const promptList = document.getElementById('promptList');
     const keyStatus = document.getElementById('keyStatus');
     const pendingStatus = document.getElementById('pendingStatus');
@@ -3025,8 +3067,12 @@ def build_web_app_html(settings: dict[str, Any]) -> str:
       progress.max = Math.max(status.total || 1, 1);
       progress.value = status.done || 0;
       renderActivity(status);
-      log.textContent = (status.logs || []).join('\\n');
-      log.parentElement.scrollTop = log.parentElement.scrollHeight;
+      const logs = status.logs || [];
+      log.textContent = logs.join('\\n');
+      logSummary.textContent = logs.length ? logs.length + ' 筆' : '0 筆';
+      if (logPanel.open) {{
+        log.parentElement.scrollTop = log.parentElement.scrollHeight;
+      }}
       results.innerHTML = (status.results || []).map(item => {{
         return `
           <tr>
