@@ -511,12 +511,8 @@ def call_gemini(
             }
         ],
         "generationConfig": {
-            "responseFormat": {
-                "text": {
-                    "mimeType": "application/json",
-                    "schema": METADATA_JSON_SCHEMA,
-                }
-            },
+            "responseMimeType": "application/json",
+            "responseJsonSchema": METADATA_JSON_SCHEMA,
             "maxOutputTokens": 1400,
         },
     }
